@@ -1,5 +1,4 @@
 //go:build !baremetal
-// +build !baremetal
 
 package interrupt
 
@@ -24,3 +23,9 @@ func Disable() (state State) {
 // calling Disable, this will not re-enable interrupts, allowing for nested
 // cricital sections.
 func Restore(state State) {}
+
+// In returns whether the system is currently in an interrupt.
+func In() bool {
+	// There are no interrupts, so it can't be in one.
+	return false
+}

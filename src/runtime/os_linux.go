@@ -1,5 +1,4 @@
 //go:build linux && !baremetal && !nintendoswitch && !wasi
-// +build linux,!baremetal,!nintendoswitch,!wasi
 
 package runtime
 
@@ -78,9 +77,9 @@ type elfProgramHeader32 struct {
 //go:extern __ehdr_start
 var ehdr_start elfHeader
 
-// markGlobals marks all globals, which are reachable by definition.
+// findGlobals finds globals in the .data/.bss sections.
 // It parses the ELF program header to find writable segments.
-func markGlobals() {
+func findGlobals(found func(start, end uintptr)) {
 	// Relevant constants from the ELF specification.
 	// See: https://refspecs.linuxfoundation.org/elf/elf.pdf
 	const (
@@ -100,17 +99,17 @@ func markGlobals() {
 			if header._type == PT_LOAD && header.flags&PF_W != 0 {
 				start := header.vaddr
 				end := start + header.memsz
-				markRoots(start, end)
+				found(start, end)
 			}
 		} else {
 			header := (*elfProgramHeader32)(headerPtr)
 			if header._type == PT_LOAD && header.flags&PF_W != 0 {
 				start := header.vaddr
 				end := start + header.memsz
-				markRoots(start, end)
+				found(start, end)
 			}
 		}
-		headerPtr = unsafe.Pointer(uintptr(headerPtr) + uintptr(ehdr_start.phentsize))
+		headerPtr = unsafe.Add(headerPtr, ehdr_start.phentsize)
 	}
 }
 

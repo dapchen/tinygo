@@ -5,29 +5,17 @@ commands:
     steps:
       - run:
           name: "Pull submodules"
-          command: git submodule update --init
-  install-xtensa-toolchain:
-    parameters:
-      variant:
-        type: string
-    steps:
-      - run:
-          name: "Install Xtensa toolchain"
-          command: |
-            curl -L https://github.com/espressif/crosstool-NG/releases/download/esp-2020r2/xtensa-esp32-elf-gcc8_2_0-esp-2020r2-<<parameters.variant>>.tar.gz -o xtensa-esp32-elf-gcc8_2_0-esp-2020r2-<<parameters.variant>>.tar.gz
-            sudo tar -C /usr/local -xf xtensa-esp32-elf-gcc8_2_0-esp-2020r2-<<parameters.variant>>.tar.gz
-            sudo ln -s /usr/local/xtensa-esp32-elf/bin/xtensa-esp32-elf-ld /usr/local/bin/xtensa-esp32-elf-ld
-            rm xtensa-esp32-elf-gcc8_2_0-esp-2020r2-<<parameters.variant>>.tar.gz
+          command: git submodule update --init --recursive
   llvm-source-linux:
     steps:
       - restore_cache:
           keys:
-            - llvm-source-14-v3
+            - llvm-source-16-v3
       - run:
           name: "Fetch LLVM source"
           command: make llvm-source
       - save_cache:
-          key: llvm-source-14-v3
+          key: llvm-source-16-v3
           paths:
             - llvm-project/clang/lib/Headers
             - llvm-project/clang/include
@@ -67,7 +55,7 @@ commands:
       - run:
           name: "Install apt dependencies"
           command: |
-            echo 'deb https://apt.llvm.org/buster/ llvm-toolchain-buster-<<parameters.llvm>> main' > /etc/apt/sources.list.d/llvm.list
+            echo 'deb https://apt.llvm.org/bullseye/ llvm-toolchain-bullseye-<<parameters.llvm>> main' > /etc/apt/sources.list.d/llvm.list
             wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -
             apt-get update
             apt-get install --no-install-recommends -y \
@@ -75,16 +63,14 @@ commands:
                 clang-<<parameters.llvm>> \
                 libclang-<<parameters.llvm>>-dev \
                 lld-<<parameters.llvm>> \
-                gcc-avr \
-                avr-libc \
                 cmake \
                 ninja-build
       - hack-ninja-jobs
       - build-binaryen-linux
       - restore_cache:
           keys:
-            - go-cache-v3-{{ checksum "go.mod" }}-{{ .Environment.CIRCLE_PREVIOUS_BUILD_NUM }}
-            - go-cache-v3-{{ checksum "go.mod" }}
+            - go-cache-v4-{{ checksum "go.mod" }}-{{ .Environment.CIRCLE_PREVIOUS_BUILD_NUM }}
+            - go-cache-v4-{{ checksum "go.mod" }}
       - llvm-source-linux
       - run: go install -tags=llvm<<parameters.llvm>> .
       - restore_cache:
@@ -106,18 +92,25 @@ commands:
       - run: make gen-device -j4
       - run: make smoketest XTENSA=0
       - save_cache:
-          key: go-cache-v3-{{ checksum "go.mod" }}-{{ .Environment.CIRCLE_BUILD_NUM }}
+          key: go-cache-v4-{{ checksum "go.mod" }}-{{ .Environment.CIRCLE_BUILD_NUM }}
           paths:
             - ~/.cache/go-build
             - /go/pkg/mod
 
 jobs:
-  test-llvm14-go118:
+  test-llvm15-go118:
     docker:
-      - image: golang:1.18-buster
+      - image: golang:1.18-bullseye
     steps:
       - test-linux:
-          llvm: "14"
+          llvm: "15"
+    resource_class: large
+  test-llvm17-go121:
+    docker:
+      - image: golang:1.21-bullseye
+    steps:
+      - test-linux:
+          llvm: "17"
     resource_class: large
 
 workflows:
@@ -125,4 +118,6 @@ workflows:
     jobs:
       # This tests our lowest supported versions of Go and LLVM, to make sure at
       # least the smoke tests still pass.
-      - test-llvm14-go118
+      - test-llvm15-go118
+      # This tests the upcoming LLVM 17 support.
+      - test-llvm17-go121

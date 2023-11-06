@@ -1,5 +1,4 @@
 //go:build stm32l5 || stm32f7 || stm32l4 || stm32l0 || stm32wlx
-// +build stm32l5 stm32f7 stm32l4 stm32l0 stm32wlx
 
 package machine
 
@@ -83,6 +82,12 @@ func (i2c *I2C) Configure(config I2CConfig) error {
 	i2c.Bus.CR1.Set(stm32.I2C_CR1_PE)
 
 	return nil
+}
+
+// SetBaudRate sets the communication speed for I2C.
+func (i2c *I2C) SetBaudRate(br uint32) error {
+	// TODO: implement
+	return errI2CNotImplemented
 }
 
 func (i2c *I2C) Tx(addr uint16, w, r []byte) error {

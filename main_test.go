@@ -34,6 +34,16 @@ var supportedLinuxArches = map[string]string{
 	"X86Linux":   "linux/386",
 	"ARMLinux":   "linux/arm/6",
 	"ARM64Linux": "linux/arm64",
+	"WASIp1":     "wasip1/wasm",
+}
+
+func init() {
+	major, _, _ := goenv.GetGorootVersion()
+	if major < 21 {
+		// Go 1.20 backwards compatibility.
+		// Should be removed once we drop support for Go 1.20.
+		delete(supportedLinuxArches, "WASIp1")
+	}
 }
 
 var sema = make(chan struct{}, runtime.NumCPU())
@@ -69,6 +79,16 @@ func TestBuild(t *testing.T) {
 		"testing.go",
 		"timers.go",
 		"zeroalloc.go",
+	}
+
+	// Go 1.21 made some changes to the language, which we can only test when
+	// we're actually on Go 1.21.
+	_, minor, err := goenv.GetGorootVersion()
+	if err != nil {
+		t.Fatal("could not get version:", minor)
+	}
+	if minor >= 21 {
+		tests = append(tests, "go1.21.go")
 	}
 
 	if *testTarget != "" {
@@ -134,10 +154,7 @@ func TestBuild(t *testing.T) {
 	})
 
 	t.Run("AVR", func(t *testing.T) {
-		// LLVM backend crash:
-		// LIBCLANG FATAL ERROR: Cannot select: t3: i16 = JumpTable<0>
-		// This bug is non-deterministic.
-		t.Skip("skipped due to non-deterministic backend bugs")
+		t.Parallel()
 		runPlatTests(optionsFromTarget("simavr", sema), tests, t)
 	})
 
@@ -169,6 +186,8 @@ func runPlatTests(options compileopts.Options, tests []string, t *testing.T) {
 		t.Fatal("failed to load target spec:", err)
 	}
 
+	isWebAssembly := options.Target == "wasi" || options.Target == "wasm" || (options.Target == "" && options.GOARCH == "wasm")
+
 	for _, name := range tests {
 		if options.GOOS == "linux" && (options.GOARCH == "arm" || options.GOARCH == "386") {
 			switch name {
@@ -183,7 +202,8 @@ func runPlatTests(options compileopts.Options, tests []string, t *testing.T) {
 			// Skip the ones that aren't.
 			switch name {
 			case "reflect.go":
-				// Reflect tests do not work due to type code issues.
+				// Reflect tests do not run correctly, probably because of the
+				// limited amount of memory.
 				continue
 
 			case "gc.go":
@@ -191,24 +211,16 @@ func runPlatTests(options compileopts.Options, tests []string, t *testing.T) {
 				continue
 
 			case "json.go", "stdlib.go", "testing.go":
-				// Breaks interp.
-				continue
-
-			case "channel.go":
-				// Freezes after recv from closed channel.
+				// Too big for AVR. Doesn't fit in flash/RAM.
 				continue
 
 			case "math.go":
-				// Stuck somewhere, not sure what's happening.
+				// Needs newer picolibc version (for sqrt).
 				continue
 
 			case "cgo/":
-				// CGo does not work on AVR.
-				continue
-
-			case "timers.go":
-				// Doesn't compile:
-				//   panic: compiler: could not store type code number inside interface type code
+				// CGo function pointers don't work on AVR (needs LLVM 16 and
+				// some compiler changes).
 				continue
 
 			default:
@@ -226,7 +238,7 @@ func runPlatTests(options compileopts.Options, tests []string, t *testing.T) {
 			runTest("env.go", options, t, []string{"first", "second"}, []string{"ENV1=VALUE1", "ENV2=VALUE2"})
 		})
 	}
-	if options.Target == "wasi" || options.Target == "wasm" {
+	if isWebAssembly {
 		t.Run("alias.go-scheduler-none", func(t *testing.T) {
 			t.Parallel()
 			options := compileopts.Options(options)
@@ -246,7 +258,7 @@ func runPlatTests(options compileopts.Options, tests []string, t *testing.T) {
 			runTest("rand.go", options, t, nil, nil)
 		})
 	}
-	if options.Target != "wasi" && options.Target != "wasm" {
+	if !isWebAssembly {
 		// The recover() builtin isn't supported yet on WebAssembly and Windows.
 		t.Run("recover.go", func(t *testing.T) {
 			t.Parallel()
@@ -336,7 +348,7 @@ func runTestWithConfig(name string, t *testing.T, options compileopts.Options, c
 
 	// Build the test binary.
 	stdout := &bytes.Buffer{}
-	err = buildAndRun("./"+path, config, stdout, cmdArgs, environmentVars, time.Minute, func(cmd *exec.Cmd, result builder.BuildResult) error {
+	_, err = buildAndRun("./"+path, config, stdout, cmdArgs, environmentVars, time.Minute, func(cmd *exec.Cmd, result builder.BuildResult) error {
 		return cmd.Run()
 	})
 	if err != nil {
@@ -435,7 +447,7 @@ func TestTest(t *testing.T) {
 				defer out.Close()
 
 				opts := targ.opts
-				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/pass", out, out, &opts, false, false, false, "", "", "", false, "")
+				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/pass", out, out, &opts, "")
 				if err != nil {
 					t.Errorf("test error: %v", err)
 				}
@@ -456,7 +468,7 @@ func TestTest(t *testing.T) {
 				defer out.Close()
 
 				opts := targ.opts
-				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/fail", out, out, &opts, false, false, false, "", "", "", false, "")
+				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/fail", out, out, &opts, "")
 				if err != nil {
 					t.Errorf("test error: %v", err)
 				}
@@ -483,7 +495,7 @@ func TestTest(t *testing.T) {
 
 				var output bytes.Buffer
 				opts := targ.opts
-				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/nothing", io.MultiWriter(&output, out), out, &opts, false, false, false, "", "", "", false, "")
+				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/nothing", io.MultiWriter(&output, out), out, &opts, "")
 				if err != nil {
 					t.Errorf("test error: %v", err)
 				}
@@ -507,7 +519,7 @@ func TestTest(t *testing.T) {
 				defer out.Close()
 
 				opts := targ.opts
-				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/builderr", out, out, &opts, false, false, false, "", "", "", false, "")
+				passed, err := Test("github.com/tinygo-org/tinygo/tests/testing/builderr", out, out, &opts, "")
 				if err == nil {
 					t.Error("test did not error")
 				}

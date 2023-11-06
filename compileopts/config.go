@@ -19,7 +19,6 @@ type Config struct {
 	Options        *Options
 	Target         *TargetSpec
 	GoMinorVersion int
-	ClangHeaders   string // Clang built-in header include path
 	TestConfig     TestConfig
 }
 
@@ -45,6 +44,12 @@ func (c *Config) Features() string {
 		return c.Target.Features
 	}
 	return c.Target.Features + "," + c.Options.LLVMFeatures
+}
+
+// ABI returns the -mabi= flag for this target (like -mabi=lp64). A zero-length
+// string is returned if the target doesn't specify an ABI.
+func (c *Config) ABI() string {
+	return c.Target.ABI
 }
 
 // GOOS returns the GOOS of the target. This might not always be the actual OS:
@@ -84,7 +89,7 @@ func (c *Config) CgoEnabled() bool {
 }
 
 // GC returns the garbage collection strategy in use on this platform. Valid
-// values are "none", "leaking", and "conservative".
+// values are "none", "leaking", "conservative" and "precise".
 func (c *Config) GC() string {
 	if c.Options.GC != "" {
 		return c.Options.GC
@@ -99,7 +104,7 @@ func (c *Config) GC() string {
 // that can be traced by the garbage collector.
 func (c *Config) NeedsStackObjects() bool {
 	switch c.GC() {
-	case "conservative":
+	case "conservative", "custom", "precise":
 		for _, tag := range c.BuildTags() {
 			if tag == "tinygo.wasm" {
 				return true
@@ -139,18 +144,18 @@ func (c *Config) Serial() string {
 
 // OptLevels returns the optimization level (0-2), size level (0-2), and inliner
 // threshold as used in the LLVM optimization pipeline.
-func (c *Config) OptLevels() (optLevel, sizeLevel int, inlinerThreshold uint) {
+func (c *Config) OptLevel() (level string, speedLevel, sizeLevel int) {
 	switch c.Options.Opt {
 	case "none", "0":
-		return 0, 0, 0 // -O0
+		return "O0", 0, 0
 	case "1":
-		return 1, 0, 0 // -O1
+		return "O1", 1, 0
 	case "2":
-		return 2, 0, 225 // -O2
+		return "O2", 2, 0
 	case "s":
-		return 2, 1, 225 // -Os
+		return "Os", 2, 1
 	case "z":
-		return 2, 2, 5 // -Oz, default
+		return "Oz", 2, 2 // default
 	default:
 		// This is not shown to the user: valid choices are already checked as
 		// part of Options.Verify(). It is here as a sanity check.
@@ -184,25 +189,6 @@ func (c *Config) StackSize() uint64 {
 	return c.Target.DefaultStackSize
 }
 
-// UseThinLTO returns whether ThinLTO should be used for the given target. Some
-// targets (such as wasm) are not yet supported.
-// We should try and remove as many exceptions as possible in the future, so
-// that this optimization can be applied in more places.
-func (c *Config) UseThinLTO() bool {
-	parts := strings.Split(c.Triple(), "-")
-	if parts[0] == "wasm32" {
-		// wasm-ld doesn't seem to support ThinLTO yet.
-		return false
-	}
-	if parts[0] == "avr" || parts[0] == "xtensa" {
-		// These use external (GNU) linkers which might perhaps support ThinLTO
-		// through a plugin, but it's too much hassle to set up.
-		return false
-	}
-	// Other architectures support ThinLTO.
-	return true
-}
-
 // RP2040BootPatch returns whether the RP2040 boot patch should be applied that
 // calculates and patches in the checksum for the 2nd stage bootloader.
 func (c *Config) RP2040BootPatch() bool {
@@ -229,6 +215,9 @@ func (c *Config) LibcPath(name string) (path string, precompiled bool) {
 	archname := c.Triple()
 	if c.CPU() != "" {
 		archname += "-" + c.CPU()
+	}
+	if c.ABI() != "" {
+		archname += "-" + c.ABI()
 	}
 
 	// Try to load a precompiled library.
@@ -269,24 +258,39 @@ func (c *Config) DefaultBinaryExtension() string {
 
 // CFlags returns the flags to pass to the C compiler. This is necessary for CGo
 // preprocessing.
-func (c *Config) CFlags() []string {
+func (c *Config) CFlags(libclang bool) []string {
 	var cflags []string
 	for _, flag := range c.Target.CFlags {
 		cflags = append(cflags, strings.ReplaceAll(flag, "{root}", goenv.Get("TINYGOROOT")))
+	}
+	resourceDir := goenv.ClangResourceDir(libclang)
+	if resourceDir != "" {
+		// The resource directory contains the built-in clang headers like
+		// stdbool.h, stdint.h, float.h, etc.
+		// It is left empty if we're using an external compiler (that already
+		// knows these headers).
+		cflags = append(cflags,
+			"-resource-dir="+resourceDir,
+		)
+		if strings.HasPrefix(c.Triple(), "xtensa") {
+			// workaround needed in LLVM 16, see: https://github.com/espressif/llvm-project/issues/83
+			cflags = append(cflags, "-isystem", filepath.Join(resourceDir, "include"))
+		}
 	}
 	switch c.Target.Libc {
 	case "darwin-libSystem":
 		root := goenv.Get("TINYGOROOT")
 		cflags = append(cflags,
-			"--sysroot="+filepath.Join(root, "lib/macos-minimal-sdk/src"),
+			"-nostdlibinc",
+			"-isystem", filepath.Join(root, "lib/macos-minimal-sdk/src/usr/include"),
 		)
 	case "picolibc":
 		root := goenv.Get("TINYGOROOT")
 		picolibcDir := filepath.Join(root, "lib", "picolibc", "newlib", "libc")
 		path, _ := c.LibcPath("picolibc")
 		cflags = append(cflags,
-			"--sysroot="+path,
-			"-isystem", filepath.Join(path, "include"), // necessary for Xtensa
+			"-nostdlibinc",
+			"-isystem", filepath.Join(path, "include"),
 			"-isystem", filepath.Join(picolibcDir, "include"),
 			"-isystem", filepath.Join(picolibcDir, "tinystdio"),
 		)
@@ -307,7 +311,8 @@ func (c *Config) CFlags() []string {
 		root := goenv.Get("TINYGOROOT")
 		path, _ := c.LibcPath("mingw-w64")
 		cflags = append(cflags,
-			"--sysroot="+path,
+			"-nostdlibinc",
+			"-isystem", filepath.Join(path, "include"),
 			"-isystem", filepath.Join(root, "lib", "mingw-w64", "mingw-w64-headers", "crt"),
 			"-isystem", filepath.Join(root, "lib", "mingw-w64", "mingw-w64-headers", "defaults", "include"),
 			"-D_UCRT",
@@ -320,7 +325,7 @@ func (c *Config) CFlags() []string {
 		panic("unknown libc: " + c.Target.Libc)
 	}
 	// Always emit debug information. It is optionally stripped at link time.
-	cflags = append(cflags, "-g")
+	cflags = append(cflags, "-gdwarf-4")
 	// Use the same optimization level as TinyGo.
 	cflags = append(cflags, "-O"+c.Options.Opt)
 	// Set the LLVM target triple.
@@ -337,6 +342,10 @@ func (c *Config) CFlags() []string {
 			// The rest just uses -mcpu.
 			cflags = append(cflags, "-mcpu="+c.Target.CPU)
 		}
+	}
+	// Set the -mabi flag, if needed.
+	if c.ABI() != "" {
+		cflags = append(cflags, "-mabi="+c.ABI())
 	}
 	return cflags
 }
@@ -498,15 +507,6 @@ func (c *Config) RelocationModel() string {
 	return "static"
 }
 
-// WasmAbi returns the WASM ABI which is specified in the target JSON file, and
-// the value is overridden by `-wasm-abi` flag if it is provided
-func (c *Config) WasmAbi() string {
-	if c.Options.WasmAbi != "" {
-		return c.Options.WasmAbi
-	}
-	return c.Target.WasmAbi
-}
-
 // EmulatorName is a shorthand to get the command for this emulator, something
 // like qemu-system-arm or simavr.
 func (c *Config) EmulatorName() string {
@@ -540,6 +540,8 @@ func (c *Config) Emulator(format, binary string) ([]string, error) {
 	var emulator []string
 	for _, s := range parts {
 		s = strings.ReplaceAll(s, "{root}", goenv.Get("TINYGOROOT"))
+		// Allow replacement of what's usually /tmp except notably Windows.
+		s = strings.ReplaceAll(s, "{tmpDir}", os.TempDir())
 		s = strings.ReplaceAll(s, "{"+format+"}", binary)
 		emulator = append(emulator, s)
 	}
@@ -548,5 +550,14 @@ func (c *Config) Emulator(format, binary string) ([]string, error) {
 
 type TestConfig struct {
 	CompileTestBinary bool
-	// TODO: Filter the test functions to run, include verbose flag, etc
+	CompileOnly       bool
+	Verbose           bool
+	Short             bool
+	RunRegexp         string
+	SkipRegexp        string
+	Count             *int
+	BenchRegexp       string
+	BenchTime         string
+	BenchMem          bool
+	Shuffle           string
 }

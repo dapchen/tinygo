@@ -1,5 +1,4 @@
 //go:build k210
-// +build k210
 
 package machine
 
@@ -393,12 +392,15 @@ func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 	uart.Receive(c)
 }
 
-func (uart *UART) WriteByte(c byte) {
+func (uart *UART) writeByte(c byte) error {
 	for uart.Bus.TXDATA.Get()&kendryte.UARTHS_TXDATA_FULL != 0 {
 	}
 
 	uart.Bus.TXDATA.Set(uint32(c))
+	return nil
 }
+
+func (uart *UART) flush() {}
 
 type SPI struct {
 	Bus *kendryte.SPI_Type
@@ -561,7 +563,19 @@ func (i2c *I2C) Configure(config I2CConfig) error {
 		config.SCL.SetFPIOAFunction(FUNC_I2C2_SCLK)
 	}
 
-	div := CPUFrequency() / config.Frequency / 16
+	i2c.SetBaudRate(config.Frequency)
+
+	i2c.Bus.INTR_MASK.Set(0)
+	i2c.Bus.DMA_CR.Set(0x03)
+	i2c.Bus.DMA_RDLR.Set(0)
+	i2c.Bus.DMA_TDLR.Set(0x4)
+
+	return nil
+}
+
+// SetBaudRate sets the communication speed for I2C.
+func (i2c *I2C) SetBaudRate(br uint32) error {
+	div := CPUFrequency() / br / 16
 
 	// Disable controller before setting the prescale register.
 	i2c.Bus.ENABLE.Set(0)
@@ -571,11 +585,6 @@ func (i2c *I2C) Configure(config I2CConfig) error {
 	// Set prescaler registers.
 	i2c.Bus.SS_SCL_HCNT.Set(uint32(div))
 	i2c.Bus.SS_SCL_LCNT.Set(uint32(div))
-
-	i2c.Bus.INTR_MASK.Set(0)
-	i2c.Bus.DMA_CR.Set(0x03)
-	i2c.Bus.DMA_RDLR.Set(0)
-	i2c.Bus.DMA_TDLR.Set(0x4)
 
 	return nil
 }

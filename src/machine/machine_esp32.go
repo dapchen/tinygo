@@ -1,5 +1,4 @@
 //go:build esp32
-// +build esp32
 
 package machine
 
@@ -144,13 +143,13 @@ func (p Pin) configure(config PinConfig, signal uint32) {
 // outFunc returns the FUNCx_OUT_SEL_CFG register used for configuring the
 // output function selection.
 func (p Pin) outFunc() *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.FUNC0_OUT_SEL_CFG)) + uintptr(p)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.FUNC0_OUT_SEL_CFG), uintptr(p)*4))
 }
 
 // inFunc returns the FUNCy_IN_SEL_CFG register used for configuring the input
 // function selection.
 func inFunc(signal uint32) *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.FUNC0_IN_SEL_CFG)) + uintptr(signal)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.FUNC0_IN_SEL_CFG), uintptr(signal)*4))
 }
 
 // Set the pin to high or low.
@@ -315,7 +314,7 @@ func (uart *UART) Configure(config UARTConfig) {
 	uart.Bus.CLKDIV.Set(peripheralClock / config.BaudRate)
 }
 
-func (uart *UART) WriteByte(b byte) error {
+func (uart *UART) writeByte(b byte) error {
 	for (uart.Bus.STATUS.Get()>>16)&0xff >= 128 {
 		// Read UART_TXFIFO_CNT from the status register, which indicates how
 		// many bytes there are in the transmit buffer. Wait until there are
@@ -324,6 +323,8 @@ func (uart *UART) WriteByte(b byte) error {
 	uart.Bus.TX_FIFO.Set(b)
 	return nil
 }
+
+func (uart *UART) flush() {}
 
 // Serial Peripheral Interface on the ESP32.
 type SPI struct {

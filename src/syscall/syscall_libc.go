@@ -1,5 +1,4 @@
-//go:build darwin || nintendoswitch || wasi
-// +build darwin nintendoswitch wasi
+//go:build darwin || nintendoswitch || wasi || wasip1
 
 package syscall
 
@@ -55,6 +54,15 @@ func Pread(fd int, p []byte, offset int64) (n int, err error) {
 	return
 }
 
+func Pwrite(fd int, p []byte, offset int64) (n int, err error) {
+	buf, count := splitSlice(p)
+	n = libc_pwrite(int32(fd), buf, uint(count), offset)
+	if n < 0 {
+		err = getErrno()
+	}
+	return
+}
+
 func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
 	newoffset = libc_lseek(int32(fd), offset, whence)
 	if newoffset < 0 {
@@ -67,6 +75,13 @@ func Open(path string, flag int, mode uint32) (fd int, err error) {
 	data := cstring(path)
 	fd = int(libc_open(&data[0], int32(flag), mode))
 	if fd < 0 {
+		err = getErrno()
+	}
+	return
+}
+
+func Fsync(fd int) (err error) {
+	if libc_fsync(int32(fd)) < 0 {
 		err = getErrno()
 	}
 	return
@@ -85,15 +100,6 @@ func Readlink(path string, p []byte) (n int, err error) {
 func Chdir(path string) (err error) {
 	data := cstring(path)
 	fail := int(libc_chdir(&data[0]))
-	if fail < 0 {
-		err = getErrno()
-	}
-	return
-}
-
-func Chmod(path string, mode uint32) (err error) {
-	data := cstring(path)
-	fail := int(libc_chmod(&data[0], mode))
 	if fail < 0 {
 		err = getErrno()
 	}
@@ -147,6 +153,8 @@ func Unlink(path string) (err error) {
 	return
 }
 
+func Faccessat(dirfd int, path string, mode uint32, flags int) (err error)
+
 func Kill(pid int, sig Signal) (err error) {
 	return ENOSYS // TODO
 }
@@ -198,21 +206,12 @@ func Setenv(key, val string) (err error) {
 			return EINVAL
 		}
 	}
-	keydata := cstring(key)
-	valdata := cstring(val)
-	errCode := libc_setenv(&keydata[0], &valdata[0], 1)
-	if errCode != 0 {
-		err = getErrno()
-	}
+	runtimeSetenv(key, val)
 	return
 }
 
 func Unsetenv(key string) (err error) {
-	keydata := cstring(key)
-	errCode := libc_unsetenv(&keydata[0])
-	if errCode != 0 {
-		err = getErrno()
-	}
+	runtimeUnsetenv(key)
 	return
 }
 
@@ -266,7 +265,7 @@ func Environ() []string {
 	for environ := libc_environ; *environ != nil; {
 		length += libc_strlen(*environ)
 		vars++
-		environ = (*unsafe.Pointer)(unsafe.Pointer(uintptr(unsafe.Pointer(environ)) + unsafe.Sizeof(environ)))
+		environ = (*unsafe.Pointer)(unsafe.Add(unsafe.Pointer(environ), unsafe.Sizeof(environ)))
 	}
 
 	// allocate our backing slice for the strings
@@ -295,9 +294,21 @@ func Environ() []string {
 		// add s to our list of environment variables
 		envs = append(envs, s)
 		// environ++
-		environ = (*unsafe.Pointer)(unsafe.Pointer(uintptr(unsafe.Pointer(environ)) + unsafe.Sizeof(environ)))
+		environ = (*unsafe.Pointer)(unsafe.Add(unsafe.Pointer(environ), unsafe.Sizeof(environ)))
 	}
 	return envs
+}
+
+// BytePtrFromString returns a pointer to a NUL-terminated array of
+// bytes containing the text of s. If s contains a NUL byte at any
+// location, it returns (nil, EINVAL).
+func BytePtrFromString(s string) (*byte, error) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0 {
+			return nil, EINVAL
+		}
+	}
+	return &cstring(s)[0], nil
 }
 
 // cstring converts a Go string to a C string.
@@ -313,6 +324,10 @@ func splitSlice(p []byte) (buf *byte, len uintptr) {
 	return slice.buf, slice.len
 }
 
+// These two functions are provided by the runtime.
+func runtimeSetenv(key, value string)
+func runtimeUnsetenv(key string)
+
 //export strlen
 func libc_strlen(ptr unsafe.Pointer) uintptr
 
@@ -326,16 +341,6 @@ func libc_write(fd int32, buf *byte, count uint) int
 //export getenv
 func libc_getenv(name *byte) *byte
 
-// int setenv(const char *name, const char *val, int replace);
-//
-//export setenv
-func libc_setenv(name *byte, val *byte, replace int32) int32
-
-// int unsetenv(const char *name);
-//
-//export unsetenv
-func libc_unsetenv(name *byte) int32
-
 // ssize_t read(int fd, void *buf, size_t count);
 //
 //export read
@@ -346,15 +351,15 @@ func libc_read(fd int32, buf *byte, count uint) int
 //export pread
 func libc_pread(fd int32, buf *byte, count uint, offset int64) int
 
+// ssize_t pwrite(int fd, void *buf, size_t count, off_t offset);
+//
+//export pwrite
+func libc_pwrite(fd int32, buf *byte, count uint, offset int64) int
+
 // ssize_t lseek(int fd, off_t offset, int whence);
 //
 //export lseek
 func libc_lseek(fd int32, offset int64, whence int) int64
-
-// int open(const char *pathname, int flags, mode_t mode);
-//
-//export open
-func libc_open(pathname *byte, flags int32, mode uint32) int32
 
 // int close(int fd)
 //
@@ -410,6 +415,11 @@ func libc_rename(from, to *byte) int32
 //
 //export symlink
 func libc_symlink(from, to *byte) int32
+
+// int fsync(int fd);
+//
+//export fsync
+func libc_fsync(fd int32) int32
 
 // ssize_t readlink(const char *path, void *buf, size_t count);
 //

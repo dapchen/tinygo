@@ -59,6 +59,22 @@ func functionInSection() {
 func exportedFunctionInSection() {
 }
 
+//go:wasmimport modulename import1
+func declaredImport()
+
+// Legacy way of importing a function.
+//
+//go:wasm-module foobar
+//export imported
+func foobarImport()
+
+// The wasm-module pragma is not functional here, but it should be safe.
+//
+//go:wasm-module foobar
+//export exported
+func foobarExportModule() {
+}
+
 // This function should not: it's only a declaration and not a definition.
 //
 //go:section .special_function_section

@@ -1,5 +1,4 @@
 //go:build nxp && mk66f18
-// +build nxp,mk66f18
 
 package volatile
 
@@ -52,7 +51,7 @@ func (r *BitRegister) Set(v bool) {
 // if R is not an AIPS or GPIO register or if N is out of range (greater than
 // the number of bits in a register minus one).
 //
-// go:inline
+//go:inline
 func (r *Register8) Bit(bit uint8) *BitRegister {
 	ptr := bitbandAddress(uintptr(unsafe.Pointer(&r.Reg)), bit)
 	return (*BitRegister)(unsafe.Pointer(ptr))
@@ -62,7 +61,7 @@ func (r *Register8) Bit(bit uint8) *BitRegister {
 // if R is not an AIPS or GPIO register or if N is out of range (greater than
 // the number of bits in a register minus one).
 //
-// go:inline
+//go:inline
 func (r *Register16) Bit(bit uint8) *BitRegister {
 	ptr := bitbandAddress(uintptr(unsafe.Pointer(&r.Reg)), bit)
 	return (*BitRegister)(unsafe.Pointer(ptr))
@@ -72,7 +71,7 @@ func (r *Register16) Bit(bit uint8) *BitRegister {
 // if R is not an AIPS or GPIO register or if N is out of range (greater than
 // the number of bits in a register minus one).
 //
-// go:inline
+//go:inline
 func (r *Register32) Bit(bit uint8) *BitRegister {
 	ptr := bitbandAddress(uintptr(unsafe.Pointer(&r.Reg)), bit)
 	return (*BitRegister)(unsafe.Pointer(ptr))

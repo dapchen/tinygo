@@ -1,5 +1,4 @@
 //go:build stm32f7
-// +build stm32f7
 
 package machine
 
@@ -11,6 +10,8 @@ import (
 	"runtime/volatile"
 	"unsafe"
 )
+
+var deviceIDAddr = []uintptr{0x1FF0F420, 0x1FF0F424, 0x1FF0F428}
 
 // Alternative peripheral pin functions
 const (

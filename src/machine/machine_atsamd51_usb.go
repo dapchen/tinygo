@@ -1,5 +1,4 @@
 //go:build (sam && atsamd51) || (sam && atsame5x)
-// +build sam,atsamd51 sam,atsame5x
 
 package machine
 
@@ -143,8 +142,9 @@ func handleUSBIRQ(intr interrupt.Interrupt) {
 		setup := usb.NewSetup(udd_ep_out_cache_buffer[0][:])
 
 		// Clear the Bank 0 ready flag on Control OUT
-		setEPSTATUSCLR(0, sam.USB_DEVICE_ENDPOINT_EPSTATUSCLR_BK0RDY)
+		usbEndpointDescriptors[0].DeviceDescBank[0].ADDR.Set(uint32(uintptr(unsafe.Pointer(&udd_ep_out_cache_buffer[0]))))
 		usbEndpointDescriptors[0].DeviceDescBank[0].PCKSIZE.ClearBits(usb_DEVICE_PCKSIZE_BYTE_COUNT_Mask << usb_DEVICE_PCKSIZE_BYTE_COUNT_Pos)
+		setEPSTATUSCLR(0, sam.USB_DEVICE_ENDPOINT_EPSTATUSCLR_BK0RDY)
 
 		ok := false
 		if (setup.BmRequestType & usb.REQUEST_TYPE) == usb.REQUEST_STANDARD {
@@ -228,7 +228,23 @@ func initEndpoint(ep, config uint32) {
 		setEPSTATUSCLR(ep, sam.USB_DEVICE_ENDPOINT_EPSTATUSCLR_BK0RDY)
 
 	case usb.ENDPOINT_TYPE_INTERRUPT | usb.EndpointOut:
-		// TODO: not really anything, seems like...
+		// set packet size
+		usbEndpointDescriptors[ep].DeviceDescBank[0].PCKSIZE.SetBits(epPacketSize(64) << usb_DEVICE_PCKSIZE_SIZE_Pos)
+
+		// set data buffer address
+		usbEndpointDescriptors[ep].DeviceDescBank[0].ADDR.Set(uint32(uintptr(unsafe.Pointer(&udd_ep_out_cache_buffer[ep]))))
+
+		// set endpoint type
+		setEPCFG(ep, ((usb.ENDPOINT_TYPE_INTERRUPT + 1) << sam.USB_DEVICE_ENDPOINT_EPCFG_EPTYPE0_Pos))
+
+		// receive interrupts when current transfer complete
+		setEPINTENSET(ep, sam.USB_DEVICE_ENDPOINT_EPINTENSET_TRCPT0)
+
+		// set byte count to zero, we have not received anything yet
+		usbEndpointDescriptors[ep].DeviceDescBank[0].PCKSIZE.ClearBits(usb_DEVICE_PCKSIZE_BYTE_COUNT_Mask << usb_DEVICE_PCKSIZE_BYTE_COUNT_Pos)
+
+		// ready for next transfer
+		setEPSTATUSCLR(ep, sam.USB_DEVICE_ENDPOINT_EPSTATUSCLR_BK0RDY)
 
 	case usb.ENDPOINT_TYPE_BULK | usb.EndpointIn:
 		// set packet size
@@ -347,15 +363,6 @@ func sendUSBPacket(ep uint32, data []byte, maxsize uint16) {
 
 func ReceiveUSBControlPacket() ([cdcLineInfoSize]byte, error) {
 	var b [cdcLineInfoSize]byte
-
-	// address
-	usbEndpointDescriptors[0].DeviceDescBank[0].ADDR.Set(uint32(uintptr(unsafe.Pointer(&udd_ep_out_cache_buffer[0]))))
-
-	// set byte count to zero
-	usbEndpointDescriptors[0].DeviceDescBank[0].PCKSIZE.ClearBits(usb_DEVICE_PCKSIZE_BYTE_COUNT_Mask << usb_DEVICE_PCKSIZE_BYTE_COUNT_Pos)
-
-	// set ready for next data
-	setEPSTATUSCLR(0, sam.USB_DEVICE_ENDPOINT_EPSTATUSCLR_BK0RDY)
 
 	// Wait until OUT transfer is ready.
 	timeout := 300000

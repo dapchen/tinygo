@@ -1,5 +1,4 @@
 //go:build macropad_rp2040
-// +build macropad_rp2040
 
 package machine
 
@@ -17,6 +16,7 @@ const (
 
 const (
 	SWITCH = GPIO0
+	BUTTON = GPIO0
 
 	KEY1  = GPIO1
 	KEY2  = GPIO2

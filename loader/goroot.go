@@ -18,7 +18,6 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -157,7 +156,7 @@ func listGorootMergeLinks(goroot, tinygoroot string, overrides map[string]bool) 
 
 		// Add files from TinyGo.
 		tinygoDir := filepath.Join(tinygoSrc, dir)
-		tinygoEntries, err := ioutil.ReadDir(tinygoDir)
+		tinygoEntries, err := os.ReadDir(tinygoDir)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +176,7 @@ func listGorootMergeLinks(goroot, tinygoroot string, overrides map[string]bool) 
 		// Add all directories from $GOROOT that are not part of the TinyGo
 		// overrides.
 		goDir := filepath.Join(goSrc, dir)
-		goEntries, err := ioutil.ReadDir(goDir)
+		goEntries, err := os.ReadDir(goDir)
 		if err != nil {
 			return nil, err
 		}
@@ -207,6 +206,11 @@ func listGorootMergeLinks(goroot, tinygoroot string, overrides map[string]bool) 
 		merges[dir] = filepath.Join(goroot, dir)
 	}
 
+	// Required starting in Go 1.21 due to https://github.com/golang/go/issues/61928
+	if _, err := os.Stat(filepath.Join(goroot, "go.env")); err == nil {
+		merges["go.env"] = filepath.Join(goroot, "go.env")
+	}
+
 	return merges, nil
 }
 
@@ -231,8 +235,8 @@ func pathsToOverride(goMinor int, needsSyscallPackage bool) map[string]bool {
 		"device/":               false,
 		"examples/":             false,
 		"internal/":             true,
-		"internal/fuzz/":        false,
 		"internal/bytealg/":     false,
+		"internal/fuzz/":        false,
 		"internal/reflectlite/": false,
 		"internal/task/":        false,
 		"machine/":              false,

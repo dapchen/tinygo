@@ -1,5 +1,4 @@
 //go:build (sam && atsamd51) || (sam && atsame5x)
-// +build sam,atsamd51 sam,atsame5x
 
 // Peripheral abstraction layer for the atsamd51.
 //
@@ -8,13 +7,19 @@
 package machine
 
 import (
+	"bytes"
 	"device/arm"
 	"device/sam"
+	"encoding/binary"
+	"errors"
 	"runtime/interrupt"
 	"unsafe"
 )
 
 const deviceName = sam.Device
+
+// DS60001507, Section 9.6: Serial Number
+var deviceIDAddr = []uintptr{0x008061FC, 0x00806010, 0x00806014, 0x00806018}
 
 func CPUFrequency() uint32 {
 	return 120000000
@@ -747,36 +752,10 @@ func (a ADC) Configure(config ADCConfig) {
 		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_CTRLB) {
 		} // wait for sync
 
-		adc.CTRLA.SetBits(sam.ADC_CTRLA_PRESCALER_DIV32 << sam.ADC_CTRLA_PRESCALER_Pos)
-		var resolution uint32
-		switch config.Resolution {
-		case 8:
-			resolution = sam.ADC_CTRLB_RESSEL_8BIT
-		case 10:
-			resolution = sam.ADC_CTRLB_RESSEL_10BIT
-		case 12:
-			resolution = sam.ADC_CTRLB_RESSEL_12BIT
-		case 16:
-			resolution = sam.ADC_CTRLB_RESSEL_16BIT
-		default:
-			resolution = sam.ADC_CTRLB_RESSEL_12BIT
-		}
-		adc.CTRLB.SetBits(uint16(resolution << sam.ADC_CTRLB_RESSEL_Pos))
-		adc.SAMPCTRL.Set(5) // sampling Time Length
-
-		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_SAMPCTRL) {
-		} // wait for sync
-
-		// No Negative input (Internal Ground)
-		adc.INPUTCTRL.Set(sam.ADC_INPUTCTRL_MUXNEG_GND << sam.ADC_INPUTCTRL_MUXNEG_Pos)
-		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_INPUTCTRL) {
-		} // wait for sync
-
 		// Averaging (see datasheet table in AVGCTRL register description)
+		var resolution uint32 = sam.ADC_CTRLB_RESSEL_16BIT
 		var samples uint32
 		switch config.Samples {
-		case 1:
-			samples = sam.ADC_AVGCTRL_SAMPLENUM_1
 		case 2:
 			samples = sam.ADC_AVGCTRL_SAMPLENUM_2
 		case 4:
@@ -798,10 +777,38 @@ func (a ADC) Configure(config ADCConfig) {
 		case 1024:
 			samples = sam.ADC_AVGCTRL_SAMPLENUM_1024
 		default: // 1 sample only (no oversampling nor averaging), adjusting result by 0
+			// Resolutions less than 16 bits only make sense when sampling only
+			// once. Resulting ADC values become erratic when using both
+			// multi-sampling and less than 16 bits of resolution.
 			samples = sam.ADC_AVGCTRL_SAMPLENUM_1
+			switch config.Resolution {
+			case 8:
+				resolution = sam.ADC_CTRLB_RESSEL_8BIT
+			case 10:
+				resolution = sam.ADC_CTRLB_RESSEL_10BIT
+			case 12:
+				resolution = sam.ADC_CTRLB_RESSEL_12BIT
+			case 16:
+				resolution = sam.ADC_CTRLB_RESSEL_16BIT
+			default:
+				resolution = sam.ADC_CTRLB_RESSEL_12BIT
+			}
 		}
+
 		adc.AVGCTRL.Set(uint8(samples<<sam.ADC_AVGCTRL_SAMPLENUM_Pos) |
 			(0 << sam.ADC_AVGCTRL_ADJRES_Pos))
+
+		adc.CTRLA.SetBits(sam.ADC_CTRLA_PRESCALER_DIV32 << sam.ADC_CTRLA_PRESCALER_Pos)
+		adc.CTRLB.SetBits(uint16(resolution << sam.ADC_CTRLB_RESSEL_Pos))
+		adc.SAMPCTRL.Set(5) // sampling Time Length
+
+		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_SAMPCTRL) {
+		} // wait for sync
+
+		// No Negative input (Internal Ground)
+		adc.INPUTCTRL.Set(sam.ADC_INPUTCTRL_MUXNEG_GND << sam.ADC_INPUTCTRL_MUXNEG_Pos)
+		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_INPUTCTRL) {
+		} // wait for sync
 
 		for adc.SYNCBUSY.HasBits(sam.ADC_SYNCBUSY_AVGCTRL) {
 		} // wait for sync
@@ -869,10 +876,24 @@ func (a ADC) Get() uint16 {
 		val = val << 8
 	case sam.ADC_CTRLB_RESSEL_10BIT:
 		val = val << 6
-	case sam.ADC_CTRLB_RESSEL_16BIT:
-		val = val << 4
 	case sam.ADC_CTRLB_RESSEL_12BIT:
 		val = val << 4
+	case sam.ADC_CTRLB_RESSEL_16BIT:
+		// Adjust for multiple samples. This is only configured when the
+		// resolution is 16 bits.
+		switch (bus.AVGCTRL.Get() & sam.ADC_AVGCTRL_SAMPLENUM_Msk) >> sam.ADC_AVGCTRL_SAMPLENUM_Pos {
+		case sam.ADC_AVGCTRL_SAMPLENUM_1:
+			val <<= 4
+		case sam.ADC_AVGCTRL_SAMPLENUM_2:
+			val <<= 3
+		case sam.ADC_AVGCTRL_SAMPLENUM_4:
+			val <<= 2
+		case sam.ADC_AVGCTRL_SAMPLENUM_8:
+			val <<= 1
+		default:
+			// These values are all shifted by the hardware so they fit exactly
+			// in a 16-bit integer, so they don't need to be shifted here.
+		}
 	}
 	return val
 }
@@ -1096,13 +1117,15 @@ func (uart *UART) SetBaudRate(br uint32) {
 }
 
 // WriteByte writes a byte of data to the UART.
-func (uart *UART) WriteByte(c byte) error {
+func (uart *UART) writeByte(c byte) error {
 	// wait until ready to receive
 	for !uart.Bus.INTFLAG.HasBits(sam.SERCOM_USART_INT_INTFLAG_DRE) {
 	}
 	uart.Bus.DATA.Set(uint32(c))
 	return nil
 }
+
+func (uart *UART) flush() {}
 
 func (uart *UART) handleInterrupt(interrupt.Interrupt) {
 	// should reset IRQ
@@ -1144,7 +1167,7 @@ const (
 	wireCmdStop        = 3
 )
 
-const i2cTimeout = 1000
+const i2cTimeout = 28000 // about 210us
 
 // Configure is intended to setup the I2C interface.
 func (i2c *I2C) Configure(config I2CConfig) error {
@@ -1208,12 +1231,13 @@ func (i2c *I2C) Configure(config I2CConfig) error {
 	return nil
 }
 
-// SetBaudRate sets the communication speed for the I2C.
-func (i2c *I2C) SetBaudRate(br uint32) {
+// SetBaudRate sets the communication speed for I2C.
+func (i2c *I2C) SetBaudRate(br uint32) error {
 	// Synchronous arithmetic baudrate, via Adafruit SAMD51 implementation:
 	// sercom->I2CM.BAUD.bit.BAUD = SERCOM_FREQ_REF / ( 2 * baudrate) - 1 ;
 	baud := SERCOM_FREQ_REF/(2*br) - 1
 	i2c.Bus.BAUD.Set(baud)
+	return nil
 }
 
 // Tx does a single I2C transaction at the specified address.
@@ -1488,22 +1512,39 @@ func (spi SPI) Configure(config SPIConfig) error {
 		spi.Bus.CTRLA.ClearBits(sam.SERCOM_SPIM_CTRLA_CPOL)
 	}
 
-	// set clock
-	freqRef := uint32(0)
-	if config.Frequency > SERCOM_FREQ_REF/2 {
-		setSERCOMClockGenerator(spi.SERCOM, sam.GCLK_PCHCTRL_GEN_GCLK0)
-		freqRef = uint32(SERCOM_FREQ_REF_GCLK0)
-	} else {
-		setSERCOMClockGenerator(spi.SERCOM, sam.GCLK_PCHCTRL_GEN_GCLK1)
-		freqRef = uint32(SERCOM_FREQ_REF)
-	}
+	// Set the clock frequency.
+	// There are two clocks we can use GCLK0 (120MHz) and GCLK1 (48MHz).
+	// We can use any even divisor for these clock, which means:
+	//   - for GCLK0 we can make 60MHz, 30MHz, 20MHz, 15MHz, 12MHz, 10MHz, etc
+	//   - for GCLK1 we can make 24MHz, 12MHz, 8MHz, 6MHz, 4.8MHz, 4MHz, etc
+	// This means that by trying both clocks, we can have a wider selection of
+	// available SPI clock frequencies.
 
-	// Set synch speed for SPI
-	baudRate := freqRef / (2 * config.Frequency)
-	if baudRate > 0 {
-		baudRate--
+	// Calculate the baudrate if we would use GCLK1 (48MHz), and the resulting
+	// frequency. The baud rate is rounded up, so that the resulting frequency
+	// is rounded down from the maximum value (meaning it will always be smaller
+	// than or equal to config.Frequency).
+	baudRateGCLK1 := (SERCOM_FREQ_REF/2 + config.Frequency - 1) / config.Frequency
+	freqGCLK1 := SERCOM_FREQ_REF / 2 / baudRateGCLK1
+
+	// Same for GCLK0 (120MHz).
+	baudRateGCLK0 := (SERCOM_FREQ_REF_GCLK0/2 + config.Frequency - 1) / config.Frequency
+	freqGCLK0 := SERCOM_FREQ_REF_GCLK0 / 2 / baudRateGCLK0
+
+	// Pick the clock source that is the closest to the maximum baud rate.
+	// Note: there may be reasons to prefer the lower frequency clock (like
+	// power consumption). If that's the case, we might want to always use the
+	// 48MHz clock at low frequencies (below 4MHz or so).
+	if freqGCLK0 > freqGCLK1 && uint32(uint8(baudRateGCLK0-1))+1 == baudRateGCLK0 {
+		// Pick this 120MHz clock if it results in a better frequency after
+		// division, and the baudRate value fits in the BAUD register.
+		setSERCOMClockGenerator(spi.SERCOM, sam.GCLK_PCHCTRL_GEN_GCLK0)
+		spi.Bus.BAUD.Set(uint8(baudRateGCLK0 - 1))
+	} else {
+		// Use the 48MHz clock in other cases.
+		setSERCOMClockGenerator(spi.SERCOM, sam.GCLK_PCHCTRL_GEN_GCLK1)
+		spi.Bus.BAUD.Set(uint8(baudRateGCLK1 - 1))
 	}
-	spi.Bus.BAUD.Set(uint8(baudRate))
 
 	// Enable SPI port.
 	spi.Bus.CTRLA.SetBits(sam.SERCOM_SPIM_CTRLA_ENABLE)
@@ -2074,4 +2115,240 @@ func GetRNG() (uint32, error) {
 	}
 	ret := sam.TRNG.DATA.Get()
 	return ret, nil
+}
+
+// Flash related code
+const memoryStart = 0x0
+
+// compile-time check for ensuring we fulfill BlockDevice interface
+var _ BlockDevice = flashBlockDevice{}
+
+var Flash flashBlockDevice
+
+type flashBlockDevice struct {
+	initComplete bool
+}
+
+// ReadAt reads the given number of bytes from the block device.
+func (f flashBlockDevice) ReadAt(p []byte, off int64) (n int, err error) {
+	if FlashDataStart()+uintptr(off)+uintptr(len(p)) > FlashDataEnd() {
+		return 0, errFlashCannotReadPastEOF
+	}
+
+	waitWhileFlashBusy()
+
+	data := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(FlashDataStart()), uintptr(off))), len(p))
+	copy(p, data)
+
+	return len(p), nil
+}
+
+// WriteAt writes the given number of bytes to the block device.
+// Only word (32 bits) length data can be programmed.
+// See SAM-D5x-E5x-Family-Data-Sheet-DS60001507.pdf page 591-592.
+// If the length of p is not long enough it will be padded with 0xFF bytes.
+// This method assumes that the destination is already erased.
+func (f flashBlockDevice) WriteAt(p []byte, off int64) (n int, err error) {
+	if FlashDataStart()+uintptr(off)+uintptr(len(p)) > FlashDataEnd() {
+		return 0, errFlashCannotWritePastEOF
+	}
+
+	address := FlashDataStart() + uintptr(off)
+	padded := f.pad(p)
+
+	settings := disableFlashCache()
+	defer restoreFlashCache(settings)
+
+	waitWhileFlashBusy()
+
+	sam.NVMCTRL.CTRLB.Set(sam.NVMCTRL_CTRLB_CMD_PBC | (sam.NVMCTRL_CTRLB_CMDEX_KEY << sam.NVMCTRL_CTRLB_CMDEX_Pos))
+
+	waitWhileFlashBusy()
+
+	for j := 0; j < len(padded); j += int(f.WriteBlockSize()) {
+		// write first word using double-word low order word
+		*(*uint32)(unsafe.Pointer(address)) = binary.LittleEndian.Uint32(padded[j : j+int(f.WriteBlockSize()/2)])
+
+		// write second word using double-word high order word
+		*(*uint32)(unsafe.Add(unsafe.Pointer(address), uintptr(f.WriteBlockSize())/2)) = binary.LittleEndian.Uint32(padded[j+int(f.WriteBlockSize()/2) : j+int(f.WriteBlockSize())])
+
+		waitWhileFlashBusy()
+
+		sam.NVMCTRL.SetADDR(uint32(address))
+		sam.NVMCTRL.CTRLB.Set(sam.NVMCTRL_CTRLB_CMD_WQW | (sam.NVMCTRL_CTRLB_CMDEX_KEY << sam.NVMCTRL_CTRLB_CMDEX_Pos))
+
+		waitWhileFlashBusy()
+
+		if err := checkFlashError(); err != nil {
+			return j, err
+		}
+
+		address += uintptr(f.WriteBlockSize())
+	}
+
+	return len(padded), nil
+}
+
+// Size returns the number of bytes in this block device.
+func (f flashBlockDevice) Size() int64 {
+	return int64(FlashDataEnd() - FlashDataStart())
+}
+
+const writeBlockSize = 8
+
+// WriteBlockSize returns the block size in which data can be written to
+// memory. It can be used by a client to optimize writes, non-aligned writes
+// should always work correctly.
+func (f flashBlockDevice) WriteBlockSize() int64 {
+	return writeBlockSize
+}
+
+const eraseBlockSizeValue = 8192
+
+func eraseBlockSize() int64 {
+	return eraseBlockSizeValue
+}
+
+// EraseBlockSize returns the smallest erasable area on this particular chip
+// in bytes. This is used for the block size in EraseBlocks.
+func (f flashBlockDevice) EraseBlockSize() int64 {
+	return eraseBlockSize()
+}
+
+// EraseBlocks erases the given number of blocks. An implementation may
+// transparently coalesce ranges of blocks into larger bundles if the chip
+// supports this. The start and len parameters are in block numbers, use
+// EraseBlockSize to map addresses to blocks.
+func (f flashBlockDevice) EraseBlocks(start, len int64) error {
+	address := FlashDataStart() + uintptr(start*f.EraseBlockSize())
+
+	settings := disableFlashCache()
+	defer restoreFlashCache(settings)
+
+	waitWhileFlashBusy()
+
+	for i := start; i < start+len; i++ {
+		sam.NVMCTRL.SetADDR(uint32(address))
+		sam.NVMCTRL.CTRLB.Set(sam.NVMCTRL_CTRLB_CMD_EB | (sam.NVMCTRL_CTRLB_CMDEX_KEY << sam.NVMCTRL_CTRLB_CMDEX_Pos))
+
+		waitWhileFlashBusy()
+
+		if err := checkFlashError(); err != nil {
+			return err
+		}
+
+		address += uintptr(f.EraseBlockSize())
+	}
+
+	return nil
+}
+
+// pad data if needed so it is long enough for correct byte alignment on writes.
+func (f flashBlockDevice) pad(p []byte) []byte {
+	overflow := int64(len(p)) % f.WriteBlockSize()
+	if overflow == 0 {
+		return p
+	}
+
+	padding := bytes.Repeat([]byte{0xff}, int(f.WriteBlockSize()-overflow))
+	return append(p, padding...)
+}
+
+func disableFlashCache() uint16 {
+	settings := sam.NVMCTRL.CTRLA.Get()
+
+	// disable caches
+	sam.NVMCTRL.SetCTRLA_CACHEDIS0(1)
+	sam.NVMCTRL.SetCTRLA_CACHEDIS1(1)
+
+	waitWhileFlashBusy()
+
+	return settings
+}
+
+func restoreFlashCache(settings uint16) {
+	sam.NVMCTRL.CTRLA.Set(settings)
+	waitWhileFlashBusy()
+}
+
+func waitWhileFlashBusy() {
+	for sam.NVMCTRL.GetSTATUS_READY() != sam.NVMCTRL_STATUS_READY {
+	}
+}
+
+var (
+	errFlashADDRE   = errors.New("errFlashADDRE")
+	errFlashPROGE   = errors.New("errFlashPROGE")
+	errFlashLOCKE   = errors.New("errFlashLOCKE")
+	errFlashECCSE   = errors.New("errFlashECCSE")
+	errFlashNVME    = errors.New("errFlashNVME")
+	errFlashSEESOVF = errors.New("errFlashSEESOVF")
+)
+
+func checkFlashError() error {
+	switch {
+	case sam.NVMCTRL.GetINTENSET_ADDRE() != 0:
+		return errFlashADDRE
+	case sam.NVMCTRL.GetINTENSET_PROGE() != 0:
+		return errFlashPROGE
+	case sam.NVMCTRL.GetINTENSET_LOCKE() != 0:
+		return errFlashLOCKE
+	case sam.NVMCTRL.GetINTENSET_ECCSE() != 0:
+		return errFlashECCSE
+	case sam.NVMCTRL.GetINTENSET_NVME() != 0:
+		return errFlashNVME
+	case sam.NVMCTRL.GetINTENSET_SEESOVF() != 0:
+		return errFlashSEESOVF
+	}
+
+	return nil
+}
+
+// Watchdog provides access to the hardware watchdog available
+// in the SAMD51.
+var Watchdog = &watchdogImpl{}
+
+const (
+	// WatchdogMaxTimeout in milliseconds (16s)
+	WatchdogMaxTimeout = (16384 * 1000) / 1024 // CYC16384/1024kHz
+)
+
+type watchdogImpl struct{}
+
+// Configure the watchdog.
+//
+// This method should not be called after the watchdog is started and on
+// some platforms attempting to reconfigure after starting the watchdog
+// is explicitly forbidden / will not work.
+func (wd *watchdogImpl) Configure(config WatchdogConfig) error {
+	// 1.024kHz clock
+	cycles := int((int64(config.TimeoutMillis) * 1024) / 1000)
+
+	// period is expressed as a power-of-two, starting at 8 / 1024ths of a second
+	period := uint8(0)
+	cfgCycles := 8
+	for cfgCycles < cycles {
+		period++
+		cfgCycles <<= 1
+
+		if period >= 0xB {
+			break
+		}
+	}
+
+	sam.WDT.CONFIG.Set(period << sam.WDT_CONFIG_PER_Pos)
+
+	return nil
+}
+
+// Starts the watchdog.
+func (wd *watchdogImpl) Start() error {
+	sam.WDT.CTRLA.SetBits(sam.WDT_CTRLA_ENABLE)
+	return nil
+}
+
+// Update the watchdog, indicating that `source` is healthy.
+func (wd *watchdogImpl) Update() {
+	// 0xA5 = magic value (see datasheet)
+	sam.WDT.CLEAR.Set(0xA5)
 }

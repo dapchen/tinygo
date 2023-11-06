@@ -6,7 +6,7 @@
 // symbols from the included files in the reference implementation directly into
 // the source.  It has also been modified to include the conditional logic from
 // the CircuitPython implementation that supports additional flash chips.  The
-// CiruitPython source is here:
+// CircuitPython source is here:
 //   https://github.com/adafruit/circuitpython/blob/main/ports/raspberrypi/stage2.c.jinja
 //
 // This file cannot be assembled directly, instead assemble the board-specific file
@@ -63,7 +63,7 @@
 // Expanded include files
 //
 #define CMD_WRITE_ENABLE 0x06
-#define CMD_READ_STATUS 0x05
+#define CMD_READ_STATUS1 0x05
 #define CMD_READ_STATUS2 0x35
 #define CMD_WRITE_STATUS1 0x01
 #define CMD_WRITE_STATUS2 0x31
@@ -301,7 +301,7 @@ program_sregs:
 # endif
     // Poll status register for write completion
 1:
-    movs r0, #CMD_READ_STATUS
+    movs r0, #CMD_READ_STATUS1
     bl read_flash_sreg
     movs r1, #1
     tst r0, r1

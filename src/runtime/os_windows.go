@@ -52,7 +52,7 @@ var module *exeHeader
 // around 160 bytes of amd64 instructions.
 // Most of this function is based on the documentation in
 // https://docs.microsoft.com/en-us/windows/win32/debug/pe-format.
-func markGlobals() {
+func findGlobals(found func(start, end uintptr)) {
 	// Constants used in this function.
 	const (
 		// https://docs.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandleexa
@@ -73,7 +73,7 @@ func markGlobals() {
 	}
 
 	// Find the PE header at offset 0x3C.
-	pe := (*peHeader)(unsafe.Pointer(uintptr(unsafe.Pointer(module)) + uintptr(module.peHeader)))
+	pe := (*peHeader)(unsafe.Add(unsafe.Pointer(module), module.peHeader))
 	if gcAsserts && pe.magic != 0x00004550 { // 0x4550 is "PE"
 		runtimePanic("cannot find PE header")
 	}
@@ -85,9 +85,9 @@ func markGlobals() {
 			// Found a writable section. Scan the entire section for roots.
 			start := uintptr(unsafe.Pointer(module)) + uintptr(section.virtualAddress)
 			end := uintptr(unsafe.Pointer(module)) + uintptr(section.virtualAddress) + uintptr(section.virtualSize)
-			markRoots(start, end)
+			found(start, end)
 		}
-		section = (*peSection)(unsafe.Pointer(uintptr(unsafe.Pointer(section)) + unsafe.Sizeof(peSection{})))
+		section = (*peSection)(unsafe.Add(unsafe.Pointer(section), unsafe.Sizeof(peSection{})))
 	}
 }
 

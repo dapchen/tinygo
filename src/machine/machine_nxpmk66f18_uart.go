@@ -28,7 +28,6 @@
 // SOFTWARE.
 
 //go:build nxp && mk66f18
-// +build nxp,mk66f18
 
 package machine
 
@@ -59,9 +58,6 @@ var (
 	ErrNotImplemented = errors.New("device has not been implemented")
 	ErrNotConfigured  = errors.New("device has not been configured")
 )
-
-//go:linkname gosched runtime.Gosched
-func gosched()
 
 // PutcharUART writes a byte to the UART synchronously, without using interrupts
 // or calling the scheduler
@@ -296,7 +292,7 @@ func (u *UART) handleStatusInterrupt(interrupt.Interrupt) {
 }
 
 // WriteByte writes a byte of data to the UART.
-func (u *UART) WriteByte(c byte) error {
+func (u *UART) writeByte(c byte) error {
 	if !u.Configured {
 		return ErrNotConfigured
 	}
@@ -309,3 +305,5 @@ func (u *UART) WriteByte(c byte) error {
 	u.C2.Set(uartC2TXActive)
 	return nil
 }
+
+func (uart *UART) flush() {}

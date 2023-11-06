@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -159,6 +160,7 @@ func (b *B) ReportAllocs() {
 // runN runs a single benchmark for the specified number of iterations.
 func (b *B) runN(n int) {
 	b.N = n
+	runtime.GC()
 	b.ResetTimer()
 	b.StartTimer()
 	b.benchFunc(b)
@@ -218,6 +220,8 @@ func (b *B) launch() {
 		b.runN(b.benchTime.n)
 	} else {
 		d := b.benchTime.d
+		b.failed = false
+		b.duration = 0
 		for n := int64(1); !b.failed && b.duration < d && n < 1e9; {
 			last := n
 			// Predict required iterations.
@@ -361,7 +365,7 @@ func runBenchmarks(matchString func(pat, str string) (bool, error), benchmarks [
 		return true
 	}
 	ctx := &benchContext{
-		match: newMatcher(matchString, *matchBenchmarks, "-test.bench"),
+		match: newMatcher(matchString, *matchBenchmarks, "-test.bench", flagSkipRegexp),
 	}
 	var bs []InternalBenchmark
 	for _, Benchmark := range benchmarks {
@@ -375,7 +379,8 @@ func runBenchmarks(matchString func(pat, str string) (bool, error), benchmarks [
 	}
 	main := &B{
 		common: common{
-			name: "Main",
+			output: &logger{},
+			name:   "Main",
 		},
 		benchTime: benchTime,
 		benchFunc: func(b *B) {
@@ -394,24 +399,32 @@ func runBenchmarks(matchString func(pat, str string) (bool, error), benchmarks [
 func (b *B) processBench(ctx *benchContext) {
 	benchName := b.name
 
-	if ctx != nil {
-		fmt.Printf("%-*s\t", ctx.maxLen, benchName)
-	}
-	r := b.doBench()
-	if b.failed {
-		// The output could be very long here, but probably isn't.
-		// We print it all, regardless, because we don't want to trim the reason
-		// the benchmark failed.
-		fmt.Printf("--- FAIL: %s\n%s", benchName, "") // b.output)
-		return
-	}
-	if ctx != nil {
-		results := r.String()
-
-		if *benchmarkMemory || b.showAllocResult {
-			results += "\t" + r.MemString()
+	for i := 0; i < flagCount; i++ {
+		if ctx != nil {
+			fmt.Printf("%-*s\t", ctx.maxLen, benchName)
 		}
-		fmt.Println(results)
+		r := b.doBench()
+		if b.failed {
+			// The output could be very long here, but probably isn't.
+			// We print it all, regardless, because we don't want to trim the reason
+			// the benchmark failed.
+			fmt.Printf("--- FAIL: %s\n%s", benchName, "") // b.output)
+			return
+		}
+		if ctx != nil {
+			results := r.String()
+
+			if *benchmarkMemory || b.showAllocResult {
+				results += "\t" + r.MemString()
+			}
+			fmt.Println(results)
+
+			// Print any benchmark output
+			if b.output.Len() > 0 {
+				fmt.Printf("--- BENCH: %s\n", benchName)
+				b.output.WriteTo(os.Stdout)
+			}
+		}
 	}
 }
 
@@ -431,8 +444,9 @@ func (b *B) Run(name string, f func(b *B)) bool {
 	b.hasSub = true
 	sub := &B{
 		common: common{
-			name:  benchName,
-			level: b.level + 1,
+			output: &logger{},
+			name:   benchName,
+			level:  b.level + 1,
 		},
 		benchFunc: f,
 		benchTime: b.benchTime,

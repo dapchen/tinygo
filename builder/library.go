@@ -29,7 +29,7 @@ type Library struct {
 	sourceDir func() string
 
 	// The source files, relative to sourceDir.
-	librarySources func(target string) []string
+	librarySources func(target string) ([]string, error)
 
 	// The source code for the crt1.o file, relative to sourceDir.
 	crt1Source string
@@ -142,7 +142,11 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 	// Note: -fdebug-prefix-map is necessary to make the output archive
 	// reproducible. Otherwise the temporary directory is stored in the archive
 	// itself, which varies each run.
-	args := append(l.cflags(target, headerPath), "-c", "-Oz", "-g", "-ffunction-sections", "-fdata-sections", "-Wno-macro-redefined", "--target="+target, "-fdebug-prefix-map="+dir+"="+remapDir)
+	args := append(l.cflags(target, headerPath), "-c", "-Oz", "-gdwarf-4", "-ffunction-sections", "-fdata-sections", "-Wno-macro-redefined", "--target="+target, "-fdebug-prefix-map="+dir+"="+remapDir)
+	resourceDir := goenv.ClangResourceDir(false)
+	if resourceDir != "" {
+		args = append(args, "-resource-dir="+resourceDir)
+	}
 	cpu := config.CPU()
 	if cpu != "" {
 		// X86 has deprecated the -mcpu flag, so we need to use -march instead.
@@ -154,6 +158,9 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 		} else {
 			args = append(args, "-mcpu="+cpu)
 		}
+	}
+	if config.ABI() != "" {
+		args = append(args, "-mabi="+config.ABI())
 	}
 	if strings.HasPrefix(target, "arm") || strings.HasPrefix(target, "thumb") {
 		if strings.Split(target, "-")[2] == "linux" {
@@ -170,16 +177,10 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 		args = append(args, "-mdouble=64")
 	}
 	if strings.HasPrefix(target, "riscv32-") {
-		args = append(args, "-march=rv32imac", "-mabi=ilp32", "-fforce-enable-int128")
+		args = append(args, "-march=rv32imac", "-fforce-enable-int128")
 	}
 	if strings.HasPrefix(target, "riscv64-") {
-		args = append(args, "-march=rv64gc", "-mabi=lp64")
-	}
-	if strings.HasPrefix(target, "xtensa") {
-		// Hack to work around an issue in the Xtensa port:
-		// https://github.com/espressif/llvm-project/issues/52
-		// Hopefully this will be fixed soon (LLVM 14).
-		args = append(args, "-D__ELF__")
+		args = append(args, "-march=rv64gc")
 	}
 
 	var once sync.Once
@@ -219,7 +220,11 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 
 	// Create jobs to compile all sources. These jobs are depended upon by the
 	// archive job above, so must be run first.
-	for _, path := range l.librarySources(target) {
+	paths, err := l.librarySources(target)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, path := range paths {
 		// Strip leading "../" parts off the path.
 		cleanpath := path
 		for strings.HasPrefix(cleanpath, "../") {
@@ -235,6 +240,9 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 				var compileArgs []string
 				compileArgs = append(compileArgs, args...)
 				compileArgs = append(compileArgs, "-o", objpath, srcpath)
+				if config.Options.PrintCommands != nil {
+					config.Options.PrintCommands("clang", compileArgs...)
+				}
 				err := runCCompiler(compileArgs...)
 				if err != nil {
 					return &commandError{"failed to build", srcpath, err}
@@ -261,6 +269,9 @@ func (l *Library) load(config *compileopts.Config, tmpdir string) (job *compileJ
 				}
 				tmpfile.Close()
 				compileArgs = append(compileArgs, "-o", tmpfile.Name(), srcpath)
+				if config.Options.PrintCommands != nil {
+					config.Options.PrintCommands("clang", compileArgs...)
+				}
 				err = runCCompiler(compileArgs...)
 				if err != nil {
 					return &commandError{"failed to build", srcpath, err}

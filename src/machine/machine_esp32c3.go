@@ -1,5 +1,4 @@
 //go:build esp32c3
-// +build esp32c3
 
 package machine
 
@@ -109,24 +108,24 @@ func (p Pin) Configure(config PinConfig) {
 // outFunc returns the FUNCx_OUT_SEL_CFG register used for configuring the
 // output function selection.
 func (p Pin) outFunc() *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.FUNC0_OUT_SEL_CFG)) + uintptr(p)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.FUNC0_OUT_SEL_CFG), uintptr(p)*4))
 }
 
 // inFunc returns the FUNCy_IN_SEL_CFG register used for configuring the input
 // function selection.
 func inFunc(signal uint32) *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.FUNC0_IN_SEL_CFG)) + uintptr(signal)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.FUNC0_IN_SEL_CFG), uintptr(signal)*4))
 }
 
 // mux returns the I/O mux configuration register corresponding to the given
 // GPIO pin.
 func (p Pin) mux() *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.IO_MUX.GPIO0)) + uintptr(p)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.IO_MUX.GPIO0), uintptr(p)*4))
 }
 
 // pin returns the PIN register corresponding to the given GPIO pin.
 func (p Pin) pin() *volatile.Register32 {
-	return (*volatile.Register32)(unsafe.Pointer((uintptr(unsafe.Pointer(&esp.GPIO.PIN0)) + uintptr(p)*4)))
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.PIN0), uintptr(p)*4))
 }
 
 // Set the pin to high or low.
@@ -494,7 +493,7 @@ func (uart *UART) enableReceiver() {
 	uart.Bus.SetINT_ENA_RXFIFO_OVF_INT_ENA(1)
 }
 
-func (uart *UART) WriteByte(b byte) error {
+func (uart *UART) writeByte(b byte) error {
 	for (uart.Bus.STATUS.Get()&esp.UART_STATUS_TXFIFO_CNT_Msk)>>esp.UART_STATUS_TXFIFO_CNT_Pos >= 128 {
 		// Read UART_TXFIFO_CNT from the status register, which indicates how
 		// many bytes there are in the transmit buffer. Wait until there are
@@ -503,3 +502,5 @@ func (uart *UART) WriteByte(b byte) error {
 	uart.Bus.FIFO.Set(uint32(b))
 	return nil
 }
+
+func (uart *UART) flush() {}

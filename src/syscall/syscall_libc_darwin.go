@@ -1,5 +1,4 @@
 //go:build darwin
-// +build darwin
 
 package syscall
 
@@ -53,6 +52,9 @@ const (
 	DT_SOCK    = 0xc
 	DT_UNKNOWN = 0x0
 	DT_WHT     = 0xe
+	F_GETFL    = 0x3
+	F_SETFL    = 0x4
+	O_NONBLOCK = 0x4
 )
 
 // Source: https://opensource.apple.com/source/xnu/xnu-7195.81.3/bsd/sys/errno.h.auto.html
@@ -63,8 +65,10 @@ const (
 	EEXIST      Errno = 17
 	EINTR       Errno = 4
 	ENOTDIR     Errno = 20
+	EISDIR      Errno = 21
 	EINVAL      Errno = 22
 	EMFILE      Errno = 24
+	EROFS       Errno = 30
 	EPIPE       Errno = 32
 	EAGAIN      Errno = 35
 	ENOTCONN    Errno = 57
@@ -144,6 +148,11 @@ type Timespec struct {
 	Nsec int64
 }
 
+// Unix returns the time stored in ts as seconds plus nanoseconds.
+func (ts *Timespec) Unix() (sec int64, nsec int64) {
+	return int64(ts.Sec), int64(ts.Nsec)
+}
+
 // Source: upstream ztypes_darwin_amd64.go
 type Dirent struct {
 	Ino       uint64
@@ -155,7 +164,6 @@ type Dirent struct {
 	Pad_cgo_0 [3]byte
 }
 
-// Go chose Linux's field names for Stat_t, see https://github.com/golang/go/issues/31735
 type Stat_t struct {
 	Dev       int32
 	Mode      uint16
@@ -165,10 +173,10 @@ type Stat_t struct {
 	Gid       uint32
 	Rdev      int32
 	Pad_cgo_0 [4]byte
-	Atim      Timespec
-	Mtim      Timespec
-	Ctim      Timespec
-	Btim      Timespec
+	Atimespec Timespec
+	Mtimespec Timespec
+	Ctimespec Timespec
+	Btimespec Timespec
 	Size      int64
 	Blocks    int64
 	Blksize   int32
@@ -260,6 +268,23 @@ func Pipe2(fds []int, flags int) (err error) {
 	return
 }
 
+func Chmod(path string, mode uint32) (err error) {
+	data := cstring(path)
+	fail := int(libc_chmod(&data[0], mode))
+	if fail < 0 {
+		err = getErrno()
+	}
+	return
+}
+
+func closedir(dir uintptr) (err error) {
+	e := libc_closedir(unsafe.Pointer(dir))
+	if e != 0 {
+		err = getErrno()
+	}
+	return
+}
+
 func readdir_r(dir uintptr, entry *Dirent, result **Dirent) (err error) {
 	e1 := libc_readdir_r(unsafe.Pointer(dir), unsafe.Pointer(entry), unsafe.Pointer(result))
 	if e1 != 0 {
@@ -272,6 +297,32 @@ func Getpagesize() int {
 	return int(libc_getpagesize())
 }
 
+// The following RawSockAddr* types have been copied from the Go source tree and
+// are here purely to fix build errors.
+
+type RawSockaddr struct {
+	Len    uint8
+	Family uint8
+	Data   [14]int8
+}
+
+type RawSockaddrInet4 struct {
+	Len    uint8
+	Family uint8
+	Port   uint16
+	Addr   [4]byte /* in_addr */
+	Zero   [8]int8
+}
+
+type RawSockaddrInet6 struct {
+	Len      uint8
+	Family   uint8
+	Port     uint16
+	Flowinfo uint32
+	Addr     [16]byte /* in6_addr */
+	Scope_id uint32
+}
+
 // int pipe(int32 *fds);
 //
 //export pipe
@@ -281,3 +332,8 @@ func libc_pipe(fds *int32) int32
 //
 //export getpagesize
 func libc_getpagesize() int32
+
+// int open(const char *pathname, int flags, mode_t mode);
+//
+//export syscall_libc_open
+func libc_open(pathname *byte, flags int32, mode uint32) int32

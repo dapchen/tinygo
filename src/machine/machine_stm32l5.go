@@ -1,5 +1,4 @@
 //go:build stm32l5
-// +build stm32l5
 
 package machine
 
@@ -11,6 +10,8 @@ import (
 	"runtime/volatile"
 	"unsafe"
 )
+
+var deviceIDAddr = []uintptr{0x0BFA0590, 0x0BFA0594, 0x0BFA0598}
 
 const (
 	AF0_SYSTEM                                = 0

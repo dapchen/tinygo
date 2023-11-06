@@ -2,6 +2,7 @@ package keyboard
 
 import (
 	"errors"
+	"machine"
 	"machine/usb/hid"
 )
 
@@ -63,8 +64,14 @@ func init() {
 	}
 }
 
-// New returns hid-keybord.
+// New returns the USB hid-keyboard port.
+// Deprecated, better to just use Port()
 func New() *keyboard {
+	return Port()
+}
+
+// Port returns the USB hid-keyboard port.
+func Port() *keyboard {
 	return Keyboard
 }
 
@@ -74,7 +81,7 @@ func newKeyboard() *keyboard {
 	}
 }
 
-func (kb *keyboard) Handler() bool {
+func (kb *keyboard) TxHandler() bool {
 	kb.waitTxc = false
 	if b, ok := kb.buf.Get(); ok {
 		kb.waitTxc = true
@@ -84,13 +91,34 @@ func (kb *keyboard) Handler() bool {
 	return false
 }
 
-func (kb *keyboard) tx(b []byte) {
-	if kb.waitTxc {
-		kb.buf.Put(b)
-	} else {
-		kb.waitTxc = true
-		hid.SendUSBPacket(b)
+func (kb *keyboard) RxHandler(b []byte) bool {
+	if len(b) >= 2 && b[0] == 2 /* ReportID */ {
+		kb.led = b[1]
 	}
+	return false
+}
+
+func (kb *keyboard) tx(b []byte) {
+	if machine.USBDev.InitEndpointComplete {
+		if kb.waitTxc {
+			kb.buf.Put(b)
+		} else {
+			kb.waitTxc = true
+			hid.SendUSBPacket(b)
+		}
+	}
+}
+
+func (kb *keyboard) NumLockLed() bool {
+	return kb.led&1 != 0
+}
+
+func (kb *keyboard) CapsLockLed() bool {
+	return kb.led&2 != 0
+}
+
+func (kb *keyboard) ScrollLockLed() bool {
+	return kb.led&4 != 0
 }
 
 func (kb *keyboard) ready() bool {
@@ -229,16 +257,26 @@ func (kb *keyboard) sendKey(consumer bool, b []byte) bool {
 
 func (kb *keyboard) keyboardSendKeys(consumer bool) bool {
 	var b [9]byte
-	b[0] = 0x02
-	b[1] = kb.mod
-	b[2] = 0x02
-	b[3] = kb.key[0]
-	b[4] = kb.key[1]
-	b[5] = kb.key[2]
-	b[6] = kb.key[3]
-	b[7] = kb.key[4]
-	b[8] = kb.key[5]
-	return kb.sendKey(consumer, b[:])
+
+	if !consumer {
+		b[0] = 0x02 // REPORT_ID
+		b[1] = kb.mod
+		b[2] = 0x02
+		b[3] = kb.key[0]
+		b[4] = kb.key[1]
+		b[5] = kb.key[2]
+		b[6] = kb.key[3]
+		b[7] = kb.key[4]
+		b[8] = kb.key[5]
+		return kb.sendKey(consumer, b[:])
+
+	} else {
+		b[0] = 0x03 // REPORT_ID
+		b[1] = uint8(kb.con[0])
+		b[2] = uint8((kb.con[0] & 0x0300) >> 8)
+
+		return kb.sendKey(consumer, b[:3])
+	}
 }
 
 // Down transmits a key-down event for the given Keycode.

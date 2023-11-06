@@ -20,27 +20,20 @@ jobs:
         shell: bash
         run: |
           HOMEBREW_NO_AUTO_UPDATE=1 brew install qemu binaryen
-      - name: Install Xtensa toolchain
-        shell: bash
-        run: |
-          curl -L https://github.com/espressif/crosstool-NG/releases/download/esp-2020r2/xtensa-esp32-elf-gcc8_2_0-esp-2020r2-macos.tar.gz -o xtensa-esp32-elf-gcc8_2_0-esp-2020r2-macos.tar.gz
-          sudo tar -C /usr/local -xf xtensa-esp32-elf-gcc8_2_0-esp-2020r2-macos.tar.gz
-          sudo ln -s /usr/local/xtensa-esp32-elf/bin/xtensa-esp32-elf-ld /usr/local/bin/xtensa-esp32-elf-ld
-          rm xtensa-esp32-elf-gcc8_2_0-esp-2020r2-macos.tar.gz
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           submodules: true
       - name: Install Go
         uses: actions/setup-go@v3
         with:
-          go-version: '1.19'
+          go-version: '1.21'
           cache: true
-      - name: Cache LLVM source
-        uses: actions/cache@v3
+      - name: Restore LLVM source cache
+        uses: actions/cache/restore@v3
         id: cache-llvm-source
         with:
-          key: llvm-source-14-macos-v1
+          key: llvm-source-16-macos-v1
           path: |
             llvm-project/clang/lib/Headers
             llvm-project/clang/include
@@ -50,11 +43,22 @@ jobs:
       - name: Download LLVM source
         if: steps.cache-llvm-source.outputs.cache-hit != 'true'
         run: make llvm-source
-      - name: Cache LLVM build
-        uses: actions/cache@v3
+      - name: Save LLVM source cache
+        uses: actions/cache/save@v3
+        if: steps.cache-llvm-source.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.cache-llvm-source.outputs.cache-primary-key }}
+          path: |
+            llvm-project/clang/lib/Headers
+            llvm-project/clang/include
+            llvm-project/compiler-rt
+            llvm-project/lld/include
+            llvm-project/llvm/include
+      - name: Restore LLVM build cache
+        uses: actions/cache/restore@v3
         id: cache-llvm-build
         with:
-          key: llvm-build-14-macos-v1
+          key: llvm-build-16-macos-v1
           path: llvm-build
       - name: Build LLVM
         if: steps.cache-llvm-build.outputs.cache-hit != 'true'
@@ -68,6 +72,12 @@ jobs:
           # build!
           make llvm-build
           find llvm-build -name CMakeFiles -prune -exec rm -r '{}' \;
+      - name: Save LLVM build cache
+        uses: actions/cache/save@v3
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.cache-llvm-build.outputs.cache-primary-key }}
+          path: llvm-build
       - name: Cache wasi-libc sysroot
         uses: actions/cache@v3
         id: cache-wasi-libc
@@ -77,9 +87,11 @@ jobs:
       - name: Build wasi-libc
         if: steps.cache-wasi-libc.outputs.cache-hit != 'true'
         run: make wasi-libc
+      - name: make gen-device
+        run: make -j3 gen-device
       - name: Test TinyGo
         shell: bash
-        run: make test GOTESTFLAGS="-v -short"
+        run: make test GOTESTFLAGS="-short"
       - name: Build TinyGo release tarball
         run: make release -j3
       - name: Test stdlib packages
@@ -96,27 +108,43 @@ jobs:
         # We're doing the former here, to keep artifact uploads fast.
         uses: actions/upload-artifact@v2
         with:
-          name: release-double-zipped
+          name: darwin-amd64-double-zipped
           path: build/tinygo.darwin-amd64.tar.gz
       - name: Smoke tests
         shell: bash
-        run: make smoketest TINYGO=$(PWD)/build/tinygo AVR=0
+        run: make smoketest TINYGO=$(PWD)/build/tinygo
   test-macos-homebrew:
     name: homebrew-install
     runs-on: macos-latest
+    strategy:
+      matrix:
+        version: [16, 17]
     steps:
-      - name: Install LLVM
-        shell: bash
+      - name: Update Homebrew
+        run: brew update
+      - name: Fix Python symlinks
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@14
+          # Github runners have broken symlinks, so relink
+          # see: https://github.com/actions/setup-python/issues/577
+          brew unlink python
+          brew link --overwrite python
+      - name: Install LLVM
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@${{ matrix.version }}
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install Go
         uses: actions/setup-go@v3
         with:
-          go-version: '1.19'
+          go-version: '1.21'
           cache: true
-      - name: Build TinyGo
+      - name: Build TinyGo (LLVM ${{ matrix.version }})
+        run: go install -tags=llvm${{ matrix.version }}
+      - name: Check binary
+        run: tinygo version
+      - name: Build TinyGo (default LLVM)
+        if: matrix.version == 16
         run: go install
       - name: Check binary
+        if: matrix.version == 16
         run: tinygo version

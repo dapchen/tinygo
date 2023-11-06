@@ -1,10 +1,11 @@
 //go:build rp2040
-// +build rp2040
 
 package machine
 
 import (
 	"device/rp"
+	"runtime/volatile"
+	"unsafe"
 )
 
 const deviceName = rp.Device
@@ -97,3 +98,40 @@ func CurrentCore() int {
 
 // NumCores returns number of cores available on the device.
 func NumCores() int { return 2 }
+
+// ChipVersion returns the version of the chip. 1 is returned for B0 and B1
+// chip.
+func ChipVersion() uint8 {
+	const (
+		SYSINFO_BASE                  = 0x40000000
+		SYSINFO_CHIP_ID_OFFSET        = 0x00000000
+		SYSINFO_CHIP_ID_REVISION_BITS = 0xf0000000
+		SYSINFO_CHIP_ID_REVISION_LSB  = 28
+	)
+
+	// First register of sysinfo is chip id
+	chipID := *(*uint32)(unsafe.Pointer(uintptr(SYSINFO_BASE + SYSINFO_CHIP_ID_OFFSET)))
+	// Version 1 == B0/B1
+	version := (chipID & SYSINFO_CHIP_ID_REVISION_BITS) >> SYSINFO_CHIP_ID_REVISION_LSB
+	return uint8(version)
+}
+
+// Single DMA channel. See rp.DMA_Type.
+type dmaChannel struct {
+	READ_ADDR   volatile.Register32
+	WRITE_ADDR  volatile.Register32
+	TRANS_COUNT volatile.Register32
+	CTRL_TRIG   volatile.Register32
+	_           [12]volatile.Register32 // aliases
+}
+
+// Static assignment of DMA channels to peripherals.
+// Allocating them statically is good enough for now. If lots of peripherals use
+// DMA, these might need to be assigned at runtime.
+const (
+	spi0DMAChannel = iota
+	spi1DMAChannel
+)
+
+// DMA channels usable on the RP2040.
+var dmaChannels = (*[12]dmaChannel)(unsafe.Pointer(rp.DMA))

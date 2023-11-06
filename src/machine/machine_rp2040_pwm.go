@@ -1,5 +1,4 @@
 //go:build rp2040
-// +build rp2040
 
 package machine
 
@@ -51,7 +50,7 @@ type pwmGroup struct {
 //
 // 0x14 is the size of a pwmGroup.
 func getPWMGroup(index uintptr) *pwmGroup {
-	return (*pwmGroup)(unsafe.Pointer(uintptr(unsafe.Pointer(rp.PWM)) + 0x14*index))
+	return (*pwmGroup)(unsafe.Add(unsafe.Pointer(rp.PWM), 0x14*index))
 }
 
 // Hardware Pulse Width Modulation (PWM) API
@@ -261,7 +260,9 @@ func (pwm *pwmGroup) setPeriod(period uint64) error {
 		maxTop = math.MaxUint16
 		// start algorithm at 95% Top. This allows us to undershoot period with prescale.
 		topStart     = 95 * maxTop / 100
-		milliseconds = 1_000_000_000
+		nanosecond   = 1                  // 1e-9 [s]
+		microsecond  = 1000 * nanosecond  // 1e-6 [s]
+		milliseconds = 1000 * microsecond // 1e-3 [s]
 		// Maximum Period is 268369920ns on rp2040, given by (16*255+15)*8*(1+0xffff)*(1+1)/16
 		// With no phase shift max period is half of this value.
 		maxPeriod = 268 * milliseconds

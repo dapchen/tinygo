@@ -28,32 +28,44 @@ func OptimizeStringToBytes(mod llvm.Module) {
 
 		// strptr is always constant because strings are always constant.
 
-		convertedAllUses := true
+		var pointerUses []llvm.Value
+		canConvertPointer := true
 		for _, use := range getUses(call) {
 			if use.IsAExtractValueInst().IsNil() {
 				// Expected an extractvalue, but this is something else.
-				convertedAllUses = false
+				canConvertPointer = false
 				continue
 			}
 			switch use.Type().TypeKind() {
 			case llvm.IntegerTypeKind:
 				// A length (len or cap). Propagate the length value.
+				// This can always be done because the byte slice is always the
+				// same length as the original string.
 				use.ReplaceAllUsesWith(strlen)
 				use.EraseFromParentAsInstruction()
 			case llvm.PointerTypeKind:
 				// The string pointer itself.
 				if !isReadOnly(use) {
-					convertedAllUses = false
+					// There is a store to the byte slice. This means that none
+					// of the pointer uses can't be propagated.
+					canConvertPointer = false
 					continue
 				}
-				use.ReplaceAllUsesWith(strptr)
-				use.EraseFromParentAsInstruction()
+				// It may be that the pointer value can be propagated, if all of
+				// the pointer uses are readonly.
+				pointerUses = append(pointerUses, use)
 			default:
 				// should not happen
 				panic("unknown return type of runtime.stringToBytes: " + use.Type().String())
 			}
 		}
-		if convertedAllUses {
+		if canConvertPointer {
+			// All pointer uses are readonly, so they can be converted.
+			for _, use := range pointerUses {
+				use.ReplaceAllUsesWith(strptr)
+				use.EraseFromParentAsInstruction()
+			}
+
 			// Call to runtime.stringToBytes can be eliminated: both the input
 			// and the output is constant.
 			call.EraseFromParentAsInstruction()
@@ -113,11 +125,6 @@ func OptimizeReflectImplements(mod llvm.Module) {
 	builder := mod.Context().NewBuilder()
 	defer builder.Dispose()
 
-	// Get a few useful object for use later.
-	targetData := llvm.NewTargetData(mod.DataLayout())
-	defer targetData.Dispose()
-	uintptrType := mod.Context().IntType(targetData.PointerSize() * 8)
-
 	// Look up the (reflect.Value).Implements() method.
 	var implementsFunc llvm.Value
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
@@ -139,17 +146,15 @@ func OptimizeReflectImplements(mod llvm.Module) {
 		if call.IsACallInst().IsNil() {
 			continue
 		}
-		interfaceTypeBitCast := call.Operand(2)
-		if interfaceTypeBitCast.IsAConstantExpr().IsNil() || interfaceTypeBitCast.Opcode() != llvm.BitCast {
-			// The asserted interface is not constant, so can't optimize this
-			// code.
+		interfaceType := stripPointerCasts(call.Operand(2))
+		if interfaceType.IsAGlobalVariable().IsNil() {
+			// Interface is unknown at compile time. This can't be optimized.
 			continue
 		}
 
-		interfaceType := interfaceTypeBitCast.Operand(0)
 		if strings.HasPrefix(interfaceType.Name(), "reflect/types.type:named:") {
 			// Get the underlying type.
-			interfaceType = llvm.ConstExtractValue(interfaceType.Initializer(), []uint32{0})
+			interfaceType = stripPointerCasts(builder.CreateExtractValue(interfaceType.Initializer(), 3, ""))
 		}
 		if !strings.HasPrefix(interfaceType.Name(), "reflect/types.type:interface:") {
 			// This is an error. The Type passed to Implements should be of
@@ -157,16 +162,15 @@ func OptimizeReflectImplements(mod llvm.Module) {
 			// reported at runtime.
 			continue
 		}
-		if interfaceType.IsAGlobalVariable().IsNil() {
-			// Interface is unknown at compile time. This can't be optimized.
+		typeAssertFunction := mod.NamedFunction(strings.TrimPrefix(interfaceType.Name(), "reflect/types.type:") + ".$typeassert")
+		if typeAssertFunction.IsNil() {
 			continue
 		}
-		typeAssertFunction := llvm.ConstExtractValue(interfaceType.Initializer(), []uint32{4}).Operand(0)
 
 		// Replace Implements call with the type assert call.
 		builder.SetInsertPointBefore(call)
-		implements := builder.CreateCall(typeAssertFunction, []llvm.Value{
-			builder.CreatePtrToInt(call.Operand(0), uintptrType, ""), // typecode to check
+		implements := builder.CreateCall(typeAssertFunction.GlobalValueType(), typeAssertFunction, []llvm.Value{
+			call.Operand(0), // typecode to check
 		}, "")
 		call.ReplaceAllUsesWith(implements)
 		call.EraseFromParentAsInstruction()

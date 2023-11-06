@@ -4,10 +4,12 @@ package main
 #include <stdio.h>
 int fortytwo(void);
 #include "main.h"
+#include "test.h"
 int mul(int, int);
 #include <string.h>
 #cgo CFLAGS: -DSOME_CONSTANT=17
 #define someDefine -5 + 2 * 7
+bool someBool;
 */
 import "C"
 
@@ -55,6 +57,9 @@ func main() {
 	var goInt8 int8 = 5
 	var _ C.int8_t = goInt8
 
+	var _ bool = C.someBool
+	var _ C._Bool = C.someBool
+
 	// more globals
 	println("bool:", C.globalBool, C.globalBool2 == true)
 	println("float:", C.globalFloat)
@@ -74,8 +79,10 @@ func main() {
 	println("union:", C.int(unsafe.Sizeof(C.globalUnion)) == C.globalUnionSize)
 	C.unionSetShort(22)
 	println("union s:", *C.globalUnion.unionfield_s())
-	C.unionSetFloat(3.14)
-	println("union f:", *C.globalUnion.unionfield_f())
+	C.unionSetFloat(C.float(6.28))
+	println("union f (C.float):", *C.globalUnion.unionfield_f())
+	C.unionSetFloat(float32(3.14))
+	println("union f (float32):", *C.globalUnion.unionfield_f())
 	C.unionSetData(5, 8, 1)
 	data := C.globalUnion.unionfield_data()
 	println("union global data:", data[0], data[1], data[2])
@@ -125,6 +132,10 @@ func main() {
 	var _ C.option3_t = C.option3A
 	println("option 2A:", C.option2A)
 	println("option 3A:", C.option3A)
+
+	// anonymous structs and enums in multiple Go files
+	var _ C.teststruct
+	var _ C.testenum
 
 	// Check that enums are considered the same width in C and CGo.
 	println("enum width matches:", unsafe.Sizeof(C.option2_t(0)) == uintptr(C.smallEnumWidth))

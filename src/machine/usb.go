@@ -1,15 +1,17 @@
 //go:build sam || nrf52840 || rp2040
-// +build sam nrf52840 rp2040
 
 package machine
 
 import (
-	"errors"
 	"machine/usb"
+	"machine/usb/descriptor"
+
+	"errors"
 )
 
 type USBDevice struct {
-	initcomplete bool
+	initcomplete         bool
+	InitEndpointComplete bool
 }
 
 var (
@@ -27,9 +29,39 @@ type Serialer interface {
 	RTS() bool
 }
 
-var usbDescriptor = usb.DescriptorCDC
+var usbDescriptor descriptor.Descriptor
 
-var usbDescriptorConfig uint8 = usb.DescriptorConfigCDC
+func usbVendorID() uint16 {
+	if usb.VendorID != 0 {
+		return usb.VendorID
+	}
+
+	return usb_VID
+}
+
+func usbProductID() uint16 {
+	if usb.ProductID != 0 {
+		return usb.ProductID
+	}
+
+	return usb_PID
+}
+
+func usbManufacturer() string {
+	if usb.Manufacturer != "" {
+		return usb.Manufacturer
+	}
+
+	return usb_STRING_MANUFACTURER
+}
+
+func usbProduct() string {
+	if usb.Product != "" {
+		return usb.Product
+	}
+
+	return usb_STRING_PRODUCT
+}
 
 // strToUTF16LEDescriptor converts a utf8 string into a string descriptor
 // note: the following code only converts ascii characters to UTF16LE. In order
@@ -38,7 +70,7 @@ var usbDescriptorConfig uint8 = usb.DescriptorConfigCDC
 // binary.
 func strToUTF16LEDescriptor(in string, out []byte) {
 	out[0] = byte(len(out))
-	out[1] = usb.STRING_DESCRIPTOR_TYPE
+	out[1] = descriptor.TypeString
 	for i, rune := range in {
 		out[(i<<1)+2] = byte(rune)
 		out[(i<<1)+3] = 0
@@ -54,7 +86,7 @@ var (
 )
 
 var (
-	usbEndpointDescriptors [usb.NumberOfEndpoints]usb.DeviceDescriptor
+	usbEndpointDescriptors [usb.NumberOfEndpoints]descriptor.Device
 
 	isEndpointHalt        = false
 	isRemoteWakeUpEnabled = false
@@ -67,10 +99,17 @@ var (
 var udd_ep_control_cache_buffer [256]uint8
 
 //go:align 4
-var udd_ep_in_cache_buffer [7][64]uint8
+var udd_ep_in_cache_buffer [usb.NumberOfEndpoints][64]uint8
 
 //go:align 4
-var udd_ep_out_cache_buffer [7][64]uint8
+var udd_ep_out_cache_buffer [usb.NumberOfEndpoints][64]uint8
+
+// usb_trans_buffer max size is 255 since that is max size
+// for a descriptor (bLength is 1 byte), and the biggest use
+// for this buffer is to transmit string descriptors.  If
+// this buffer is used for new purposes in future the length
+// must be revisited.
+var usb_trans_buffer [255]uint8
 
 var (
 	usbTxHandler    [usb.NumberOfEndpoints]func()
@@ -83,8 +122,9 @@ var (
 		usb.CDC_ENDPOINT_OUT:  (usb.ENDPOINT_TYPE_BULK | usb.EndpointOut),
 		usb.CDC_ENDPOINT_IN:   (usb.ENDPOINT_TYPE_BULK | usb.EndpointIn),
 		usb.HID_ENDPOINT_IN:   (usb.ENDPOINT_TYPE_DISABLE), // Interrupt In
-		usb.MIDI_ENDPOINT_OUT: (usb.ENDPOINT_TYPE_DISABLE), // Bulk Out
+		usb.HID_ENDPOINT_OUT:  (usb.ENDPOINT_TYPE_DISABLE), // Interrupt Out
 		usb.MIDI_ENDPOINT_IN:  (usb.ENDPOINT_TYPE_DISABLE), // Bulk In
+		usb.MIDI_ENDPOINT_OUT: (usb.ENDPOINT_TYPE_DISABLE), // Bulk Out
 	}
 )
 
@@ -92,38 +132,31 @@ var (
 // can be requested by the host.
 func sendDescriptor(setup usb.Setup) {
 	switch setup.WValueH {
-	case usb.CONFIGURATION_DESCRIPTOR_TYPE:
+	case descriptor.TypeConfiguration:
 		sendUSBPacket(0, usbDescriptor.Configuration, setup.WLength)
 		return
-	case usb.DEVICE_DESCRIPTOR_TYPE:
-		// composite descriptor
-		switch {
-		case (usbDescriptorConfig & usb.DescriptorConfigHID) > 0:
-			usbDescriptor = usb.DescriptorCDCHID
-		case (usbDescriptorConfig & usb.DescriptorConfigMIDI) > 0:
-			usbDescriptor = usb.DescriptorCDCMIDI
-		default:
-			usbDescriptor = usb.DescriptorCDC
-		}
-
-		usbDescriptor.Configure(usb_VID, usb_PID)
+	case descriptor.TypeDevice:
+		usbDescriptor.Configure(usbVendorID(), usbProductID())
 		sendUSBPacket(0, usbDescriptor.Device, setup.WLength)
 		return
 
-	case usb.STRING_DESCRIPTOR_TYPE:
+	case descriptor.TypeString:
 		switch setup.WValueL {
 		case 0:
-			b := []byte{0x04, 0x03, 0x09, 0x04}
-			sendUSBPacket(0, b, setup.WLength)
+			usb_trans_buffer[0] = 0x04
+			usb_trans_buffer[1] = 0x03
+			usb_trans_buffer[2] = 0x09
+			usb_trans_buffer[3] = 0x04
+			sendUSBPacket(0, usb_trans_buffer[:4], setup.WLength)
 
 		case usb.IPRODUCT:
-			b := make([]byte, (len(usb_STRING_PRODUCT)<<1)+2)
-			strToUTF16LEDescriptor(usb_STRING_PRODUCT, b)
+			b := usb_trans_buffer[:(len(usbProduct())<<1)+2]
+			strToUTF16LEDescriptor(usbProduct(), b)
 			sendUSBPacket(0, b, setup.WLength)
 
 		case usb.IMANUFACTURER:
-			b := make([]byte, (len(usb_STRING_MANUFACTURER)<<1)+2)
-			strToUTF16LEDescriptor(usb_STRING_MANUFACTURER, b)
+			b := usb_trans_buffer[:(len(usbManufacturer())<<1)+2]
+			strToUTF16LEDescriptor(usbManufacturer(), b)
 			sendUSBPacket(0, b, setup.WLength)
 
 		case usb.ISERIAL:
@@ -131,12 +164,12 @@ func sendDescriptor(setup usb.Setup) {
 			SendZlp()
 		}
 		return
-	case usb.HID_REPORT_TYPE:
+	case descriptor.TypeHIDReport:
 		if h, ok := usbDescriptor.HID[setup.WIndex]; ok {
 			sendUSBPacket(0, h, setup.WLength)
 			return
 		}
-	case usb.DEVICE_QUALIFIER:
+	case descriptor.TypeDeviceQualifier:
 		// skip
 	default:
 	}
@@ -149,15 +182,16 @@ func sendDescriptor(setup usb.Setup) {
 func handleStandardSetup(setup usb.Setup) bool {
 	switch setup.BRequest {
 	case usb.GET_STATUS:
-		buf := []byte{0, 0}
+		usb_trans_buffer[0] = 0
+		usb_trans_buffer[1] = 0
 
 		if setup.BmRequestType != 0 { // endpoint
 			if isEndpointHalt {
-				buf[0] = 1
+				usb_trans_buffer[0] = 1
 			}
 		}
 
-		sendUSBPacket(0, buf, setup.WLength)
+		sendUSBPacket(0, usb_trans_buffer[:2], setup.WLength)
 		return true
 
 	case usb.CLEAR_FEATURE:
@@ -189,8 +223,8 @@ func handleStandardSetup(setup usb.Setup) bool {
 		return false
 
 	case usb.GET_CONFIGURATION:
-		buff := []byte{usbConfiguration}
-		sendUSBPacket(0, buff, setup.WLength)
+		usb_trans_buffer[0] = usbConfiguration
+		sendUSBPacket(0, usb_trans_buffer[:1], setup.WLength)
 		return true
 
 	case usb.SET_CONFIGURATION:
@@ -200,6 +234,7 @@ func handleStandardSetup(setup usb.Setup) bool {
 			}
 
 			usbConfiguration = setup.WValueL
+			USBDev.InitEndpointComplete = true
 
 			SendZlp()
 			return true
@@ -208,8 +243,8 @@ func handleStandardSetup(setup usb.Setup) bool {
 		}
 
 	case usb.GET_INTERFACE:
-		buff := []byte{usbSetInterface}
-		sendUSBPacket(0, buff, setup.WLength)
+		usb_trans_buffer[0] = usbSetInterface
+		sendUSBPacket(0, usb_trans_buffer[:1], setup.WLength)
 		return true
 
 	case usb.SET_INTERFACE:
@@ -224,29 +259,56 @@ func handleStandardSetup(setup usb.Setup) bool {
 }
 
 func EnableCDC(txHandler func(), rxHandler func([]byte), setupHandler func(usb.Setup) bool) {
-	usbDescriptorConfig |= usb.DescriptorConfigCDC
-	endPoints[usb.CDC_ENDPOINT_ACM] = (usb.ENDPOINT_TYPE_INTERRUPT | usb.EndpointIn)
-	endPoints[usb.CDC_ENDPOINT_OUT] = (usb.ENDPOINT_TYPE_BULK | usb.EndpointOut)
-	endPoints[usb.CDC_ENDPOINT_IN] = (usb.ENDPOINT_TYPE_BULK | usb.EndpointIn)
-	usbRxHandler[usb.CDC_ENDPOINT_OUT] = rxHandler
-	usbTxHandler[usb.CDC_ENDPOINT_IN] = txHandler
-	usbSetupHandler[usb.CDC_ACM_INTERFACE] = setupHandler // 0x02 (Communications and CDC Control)
-	usbSetupHandler[usb.CDC_DATA_INTERFACE] = nil         // 0x0A (CDC-Data)
+	if len(usbDescriptor.Device) == 0 {
+		usbDescriptor = descriptor.CDC
+	}
+	// Initialization of endpoints is required even for non-CDC
+	ConfigureUSBEndpoint(usbDescriptor,
+		[]usb.EndpointConfig{
+			{
+				Index: usb.CDC_ENDPOINT_ACM,
+				IsIn:  true,
+				Type:  usb.ENDPOINT_TYPE_INTERRUPT,
+			},
+			{
+				Index:     usb.CDC_ENDPOINT_OUT,
+				IsIn:      false,
+				Type:      usb.ENDPOINT_TYPE_BULK,
+				RxHandler: rxHandler,
+			},
+			{
+				Index:     usb.CDC_ENDPOINT_IN,
+				IsIn:      true,
+				Type:      usb.ENDPOINT_TYPE_BULK,
+				TxHandler: txHandler,
+			},
+		},
+		[]usb.SetupConfig{
+			{
+				Index:   usb.CDC_ACM_INTERFACE,
+				Handler: setupHandler,
+			},
+		})
 }
 
-// EnableHID enables HID. This function must be executed from the init().
-func EnableHID(txHandler func(), rxHandler func([]byte), setupHandler func(usb.Setup) bool) {
-	usbDescriptorConfig |= usb.DescriptorConfigHID
-	endPoints[usb.HID_ENDPOINT_IN] = (usb.ENDPOINT_TYPE_INTERRUPT | usb.EndpointIn)
-	usbTxHandler[usb.HID_ENDPOINT_IN] = txHandler
-	usbSetupHandler[usb.HID_INTERFACE] = setupHandler // 0x03 (HID - Human Interface Device)
-}
+func ConfigureUSBEndpoint(desc descriptor.Descriptor, epSettings []usb.EndpointConfig, setup []usb.SetupConfig) {
+	usbDescriptor = desc
 
-// EnableMIDI enables MIDI. This function must be executed from the init().
-func EnableMIDI(txHandler func(), rxHandler func([]byte), setupHandler func(usb.Setup) bool) {
-	usbDescriptorConfig |= usb.DescriptorConfigMIDI
-	endPoints[usb.MIDI_ENDPOINT_OUT] = (usb.ENDPOINT_TYPE_BULK | usb.EndpointOut)
-	endPoints[usb.MIDI_ENDPOINT_IN] = (usb.ENDPOINT_TYPE_BULK | usb.EndpointIn)
-	usbRxHandler[usb.MIDI_ENDPOINT_OUT] = rxHandler
-	usbTxHandler[usb.MIDI_ENDPOINT_IN] = txHandler
+	for _, ep := range epSettings {
+		if ep.IsIn {
+			endPoints[ep.Index] = uint32(ep.Type | usb.EndpointIn)
+			if ep.TxHandler != nil {
+				usbTxHandler[ep.Index] = ep.TxHandler
+			}
+		} else {
+			endPoints[ep.Index] = uint32(ep.Type | usb.EndpointOut)
+			if ep.RxHandler != nil {
+				usbRxHandler[ep.Index] = ep.RxHandler
+			}
+		}
+	}
+
+	for _, s := range setup {
+		usbSetupHandler[s.Index] = s.Handler
+	}
 }

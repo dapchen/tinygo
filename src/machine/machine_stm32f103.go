@@ -1,5 +1,4 @@
 //go:build stm32 && stm32f103
-// +build stm32,stm32f103
 
 package machine
 
@@ -15,6 +14,8 @@ import (
 func CPUFrequency() uint32 {
 	return 72000000
 }
+
+var deviceIDAddr = []uintptr{0x1FFFF7E8, 0x1FFFF7EC, 0x1FFFF7F0}
 
 // Internal use: configured speed of the APB1 and APB2 timers, this should be kept
 // in sync with any changes to runtime package which configures the oscillators

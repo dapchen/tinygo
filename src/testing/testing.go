@@ -13,8 +13,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
+	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -23,9 +26,12 @@ import (
 
 // Testing flags.
 var (
-	flagVerbose   bool
-	flagShort     bool
-	flagRunRegexp string
+	flagVerbose    bool
+	flagShort      bool
+	flagRunRegexp  string
+	flagSkipRegexp string
+	flagShuffle    string
+	flagCount      int
 )
 
 var initRan bool
@@ -40,6 +46,10 @@ func Init() {
 	flag.BoolVar(&flagVerbose, "test.v", false, "verbose: print additional output")
 	flag.BoolVar(&flagShort, "test.short", false, "short: run smaller test suite to save time")
 	flag.StringVar(&flagRunRegexp, "test.run", "", "run: regexp of tests to run")
+	flag.StringVar(&flagSkipRegexp, "test.skip", "", "skip: regexp of tests to run")
+	flag.StringVar(&flagShuffle, "test.shuffle", "off", "shuffle: off, on, <numeric-seed>")
+
+	flag.IntVar(&flagCount, "test.count", 1, "run each test or benchmark `count` times")
 
 	initBenchmarkFlags()
 }
@@ -47,7 +57,7 @@ func Init() {
 // common holds the elements common between T and B and
 // captures common methods such as Errorf.
 type common struct {
-	output   bytes.Buffer
+	output   *logger
 	indent   string
 	ran      bool     // Test or benchmark (or one of its subtests) was executed.
 	failed   bool     // Test or benchmark has failed.
@@ -68,6 +78,31 @@ type common struct {
 	tempDirSeq int32
 }
 
+type logger struct {
+	logToStdout bool
+	b           bytes.Buffer
+}
+
+func (l *logger) Write(p []byte) (int, error) {
+	if l.logToStdout {
+		return os.Stdout.Write(p)
+	}
+	return l.b.Write(p)
+}
+
+func (l *logger) WriteTo(w io.Writer) (int64, error) {
+	if l.logToStdout {
+		// We've already been logging to stdout; nothing to do.
+		return 0, nil
+	}
+	return l.b.WriteTo(w)
+
+}
+
+func (l *logger) Len() int {
+	return l.b.Len()
+}
+
 // Short reports whether the -test.short flag is set.
 func Short() bool {
 	return flagShort
@@ -85,6 +120,15 @@ func Verbose() bool {
 	return flagVerbose
 }
 
+// String constant that is being set when running a test.
+var testBinary string
+
+// Testing returns whether the program was compiled as a test, using "tinygo
+// test". It returns false when built using "tinygo build", "tinygo flash", etc.
+func Testing() bool {
+	return testBinary == "1"
+}
+
 // flushToParent writes c.output to the parent after first writing the header
 // with the given format and arguments.
 func (c *common) flushToParent(testName, format string, args ...interface{}) {
@@ -93,8 +137,8 @@ func (c *common) flushToParent(testName, format string, args ...interface{}) {
 		// Not quite sure how this works upstream.
 		c.output.WriteTo(os.Stdout)
 	} else {
-		fmt.Fprintf(&c.parent.output, format, args...)
-		c.output.WriteTo(&c.parent.output)
+		fmt.Fprintf(c.parent.output, format, args...)
+		c.output.WriteTo(c.parent.output)
 	}
 }
 
@@ -117,6 +161,7 @@ type TB interface {
 	Log(args ...interface{})
 	Logf(format string, args ...interface{})
 	Name() string
+	Setenv(key, value string)
 	Skip(args ...interface{})
 	SkipNow()
 	Skipf(format string, args ...interface{})
@@ -175,16 +220,10 @@ func (c *common) log(s string) {
 	}
 	lines := strings.Split(s, "\n")
 	// First line.
-	c.output.WriteString(c.indent)
-	c.output.WriteString("    ") // 4 spaces
-	c.output.WriteString(lines[0])
-	c.output.WriteByte('\n')
+	fmt.Fprintf(c.output, "%s    %s\n", c.indent, lines[0])
 	// More lines.
 	for _, line := range lines[1:] {
-		c.output.WriteString(c.indent)
-		c.output.WriteString("        ") // 8 spaces
-		c.output.WriteString(line)
-		c.output.WriteByte('\n')
+		fmt.Fprintf(c.output, "%s        %s\n", c.indent, line)
 	}
 }
 
@@ -330,6 +369,27 @@ func (c *common) TempDir() string {
 	return dir
 }
 
+// Setenv calls os.Setenv(key, value) and uses Cleanup to
+// restore the environment variable to its original value
+// after the test.
+func (c *common) Setenv(key, value string) {
+	prevValue, ok := os.LookupEnv(key)
+
+	if err := os.Setenv(key, value); err != nil {
+		c.Fatalf("cannot set environment variable: %v", err)
+	}
+
+	if ok {
+		c.Cleanup(func() {
+			os.Setenv(key, prevValue)
+		})
+	} else {
+		c.Cleanup(func() {
+			os.Unsetenv(key)
+		})
+	}
+}
+
 // runCleanup is called at the end of the test.
 func (c *common) runCleanup() {
 	for {
@@ -385,6 +445,7 @@ func (t *T) Run(name string, f func(t *T)) bool {
 	// Create a subtest.
 	sub := T{
 		common: common{
+			output: &logger{logToStdout: flagVerbose},
 			name:   testName,
 			parent: &t.common,
 			level:  t.level + 1,
@@ -395,7 +456,7 @@ func (t *T) Run(name string, f func(t *T)) bool {
 		sub.indent = sub.indent + "    "
 	}
 	if flagVerbose {
-		fmt.Fprintf(&t.output, "=== RUN   %s\n", sub.name)
+		fmt.Fprintf(t.output, "=== RUN   %s\n", sub.name)
 	}
 
 	tRunner(&sub, f)
@@ -431,6 +492,27 @@ type testDeps interface {
 	MatchString(pat, str string) (bool, error)
 }
 
+func (m *M) shuffle() error {
+	var n int64
+
+	if flagShuffle == "on" {
+		n = time.Now().UnixNano()
+	} else {
+		var err error
+		n, err = strconv.ParseInt(flagShuffle, 10, 64)
+		if err != nil {
+			m.exitCode = 2
+			return fmt.Errorf(`testing: -shuffle should be "off", "on", or a valid integer: %v`, err)
+		}
+	}
+
+	fmt.Println("-test.shuffle", n)
+	rng := rand.New(rand.NewSource(n))
+	rng.Shuffle(len(m.Tests), func(i, j int) { m.Tests[i], m.Tests[j] = m.Tests[j], m.Tests[i] })
+	rng.Shuffle(len(m.Benchmarks), func(i, j int) { m.Benchmarks[i], m.Benchmarks[j] = m.Benchmarks[j], m.Benchmarks[i] })
+	return nil
+}
+
 // Run runs the tests. It returns an exit code to pass to os.Exit.
 func (m *M) Run() (code int) {
 	defer func() {
@@ -441,6 +523,13 @@ func (m *M) Run() (code int) {
 		flag.Parse()
 	}
 
+	if flagShuffle != "off" {
+		if err := m.shuffle(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+	}
+
 	testRan, testOk := runTests(m.deps.MatchString, m.Tests)
 	if !testRan && *matchBenchmarks == "" {
 		fmt.Fprintln(os.Stderr, "testing: warning: no tests to run")
@@ -449,9 +538,7 @@ func (m *M) Run() (code int) {
 		fmt.Println("FAIL")
 		m.exitCode = 1
 	} else {
-		if flagVerbose {
-			fmt.Println("PASS")
-		}
+		fmt.Println("PASS")
 		m.exitCode = 0
 	}
 	return
@@ -460,17 +547,22 @@ func (m *M) Run() (code int) {
 func runTests(matchString func(pat, str string) (bool, error), tests []InternalTest) (ran, ok bool) {
 	ok = true
 
-	ctx := newTestContext(newMatcher(matchString, flagRunRegexp, "-test.run"))
+	ctx := newTestContext(newMatcher(matchString, flagRunRegexp, "-test.run", flagSkipRegexp))
 	t := &T{
+		common: common{
+			output: &logger{logToStdout: flagVerbose},
+		},
 		context: ctx,
 	}
 
-	tRunner(t, func(t *T) {
-		for _, test := range tests {
-			t.Run(test.Name, test.F)
-			ok = ok && !t.Failed()
-		}
-	})
+	for i := 0; i < flagCount; i++ {
+		tRunner(t, func(t *T) {
+			for _, test := range tests {
+				t.Run(test.Name, test.F)
+				ok = ok && !t.Failed()
+			}
+		})
+	}
 
 	return t.ran, ok
 }
@@ -522,4 +614,15 @@ func MainStart(deps interface{}, tests []InternalTest, benchmarks []InternalBenc
 		Benchmarks: benchmarks,
 		deps:       deps.(testDeps),
 	}
+}
+
+// A fake regexp matcher.
+// Inflexible, but saves 50KB of flash and 50KB of RAM per -size full,
+// and lets tests pass on cortex-m.
+func fakeMatchString(pat, str string) (bool, error) {
+	if pat == ".*" {
+		return true, nil
+	}
+	matched := strings.Contains(str, pat)
+	return matched, nil
 }

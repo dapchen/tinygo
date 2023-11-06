@@ -1,5 +1,4 @@
 //go:build mimxrt1062
-// +build mimxrt1062
 
 package machine
 
@@ -69,7 +68,7 @@ var (
 )
 
 // Configure is intended to setup an SPI interface for transmit/receive.
-func (spi *SPI) Configure(config SPIConfig) {
+func (spi *SPI) Configure(config SPIConfig) error {
 
 	const defaultSpiFreq = 4000000 // 4 MHz
 
@@ -133,6 +132,8 @@ func (spi *SPI) Configure(config SPIConfig) {
 	spi.Bus.CR.Set(nxp.LPSPI_CR_MEN)
 
 	spi.configured = true
+
+	return nil
 }
 
 // Transfer writes/reads a single byte using the SPI interface.

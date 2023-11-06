@@ -1,4 +1,4 @@
-// +build byollvm
+//go:build byollvm
 
 //===-- cc1as.cpp - Clang Assembler  --------------------------------------===//
 //
@@ -56,6 +56,7 @@
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <memory>
+#include <optional>
 #include <system_error>
 using namespace clang;
 using namespace clang::driver;
@@ -101,6 +102,17 @@ bool AssemblerInvocation::CreateFromArgs(AssemblerInvocation &Opts,
 
   // Target Options
   Opts.Triple = llvm::Triple::normalize(Args.getLastArgValue(OPT_triple));
+  if (Arg *A = Args.getLastArg(options::OPT_darwin_target_variant_triple))
+    Opts.DarwinTargetVariantTriple = llvm::Triple(A->getValue());
+  if (Arg *A = Args.getLastArg(OPT_darwin_target_variant_sdk_version_EQ)) {
+    VersionTuple Version;
+    if (Version.tryParse(A->getValue()))
+      Diags.Report(diag::err_drv_invalid_value)
+          << A->getAsString(Args) << A->getValue();
+    else
+      Opts.DarwinTargetVariantSDKVersion = Version;
+  }
+
   Opts.CPU = std::string(Args.getLastArgValue(OPT_target_cpu));
   Opts.Features = Args.getAllArgValues(OPT_target_feature);
 
@@ -119,11 +131,12 @@ bool AssemblerInvocation::CreateFromArgs(AssemblerInvocation &Opts,
     Opts.CompressDebugSections =
         llvm::StringSwitch<llvm::DebugCompressionType>(A->getValue())
             .Case("none", llvm::DebugCompressionType::None)
-            .Case("zlib", llvm::DebugCompressionType::Z)
+            .Case("zlib", llvm::DebugCompressionType::Zlib)
+            .Case("zstd", llvm::DebugCompressionType::Zstd)
             .Default(llvm::DebugCompressionType::None);
   }
 
-  Opts.RelaxELFRelocations = Args.hasArg(OPT_mrelax_relocations);
+  Opts.RelaxELFRelocations = !Args.hasArg(OPT_mrelax_relocations_no);
   if (auto *DwarfFormatArg = Args.getLastArg(OPT_gdwarf64, OPT_gdwarf32))
     Opts.Dwarf64 = DwarfFormatArg->getOption().matches(OPT_gdwarf64);
   Opts.DwarfVersion = getLastArgIntValue(Args, OPT_dwarf_version_EQ, 2, Diags);
@@ -186,6 +199,7 @@ bool AssemblerInvocation::CreateFromArgs(AssemblerInvocation &Opts,
   Opts.NoExecStack = Args.hasArg(OPT_mno_exec_stack);
   Opts.FatalWarnings = Args.hasArg(OPT_massembler_fatal_warnings);
   Opts.NoWarn = Args.hasArg(OPT_massembler_no_warn);
+  Opts.NoTypeCheck = Args.hasArg(OPT_mno_type_check);
   Opts.RelocationModel =
       std::string(Args.getLastArgValue(OPT_mrelocation_model, "pic"));
   Opts.TargetABI = std::string(Args.getLastArgValue(OPT_target_abi));
@@ -202,6 +216,16 @@ bool AssemblerInvocation::CreateFromArgs(AssemblerInvocation &Opts,
                             .Case("marker", 1)
                             .Default(0);
   }
+
+  if (auto *A = Args.getLastArg(OPT_femit_dwarf_unwind_EQ)) {
+    Opts.EmitDwarfUnwind =
+        llvm::StringSwitch<EmitDwarfUnwindType>(A->getValue())
+            .Case("always", EmitDwarfUnwindType::Always)
+            .Case("no-compact-unwind", EmitDwarfUnwindType::NoCompactUnwind)
+            .Case("default", EmitDwarfUnwindType::Default);
+  }
+
+  Opts.AsSecureLogFile = Args.getLastArgValue(OPT_as_secure_log_file);
 
   return Success;
 }
@@ -253,6 +277,9 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
   assert(MRI && "Unable to create target register info!");
 
   MCTargetOptions MCOptions;
+  MCOptions.EmitDwarfUnwind = Opts.EmitDwarfUnwind;
+  MCOptions.AsSecureLogFile = Opts.AsSecureLogFile;
+
   std::unique_ptr<MCAsmInfo> MAI(
       TheTarget->createMCAsmInfo(*MRI, Opts.Triple, MCOptions));
   assert(MAI && "Unable to create target asm info!");
@@ -299,6 +326,10 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
   // MCObjectFileInfo needs a MCContext reference in order to initialize itself.
   std::unique_ptr<MCObjectFileInfo> MOFI(
       TheTarget->createMCObjectFileInfo(Ctx, PIC));
+  if (Opts.DarwinTargetVariantTriple)
+    MOFI->setDarwinTargetVariantTriple(*Opts.DarwinTargetVariantTriple);
+  if (!Opts.DarwinTargetVariantSDKVersion.empty())
+    MOFI->setDarwinTargetVariantSDKVersion(Opts.DarwinTargetVariantSDKVersion);
   Ctx.setObjectFileInfo(MOFI.get());
 
   if (Opts.SaveTemporaryLabels)
@@ -338,6 +369,7 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
 
   MCOptions.MCNoWarn = Opts.NoWarn;
   MCOptions.MCFatalWarnings = Opts.FatalWarnings;
+  MCOptions.MCNoTypeCheck = Opts.NoTypeCheck;
   MCOptions.ABIName = Opts.TargetABI;
 
   // FIXME: There is a bit of code duplication with addPassesToEmitFile.
@@ -347,7 +379,7 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
 
     std::unique_ptr<MCCodeEmitter> CE;
     if (Opts.ShowEncoding)
-      CE.reset(TheTarget->createMCCodeEmitter(*MCII, *MRI, Ctx));
+      CE.reset(TheTarget->createMCCodeEmitter(*MCII, Ctx));
     std::unique_ptr<MCAsmBackend> MAB(
         TheTarget->createMCAsmBackend(*STI, *MRI, MCOptions));
 
@@ -367,7 +399,7 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
     }
 
     std::unique_ptr<MCCodeEmitter> CE(
-        TheTarget->createMCCodeEmitter(*MCII, *MRI, Ctx));
+        TheTarget->createMCCodeEmitter(*MCII, Ctx));
     std::unique_ptr<MCAsmBackend> MAB(
         TheTarget->createMCAsmBackend(*STI, *MRI, MCOptions));
     assert(MAB && "Unable to create asm backend!");
@@ -389,7 +421,7 @@ static bool ExecuteAssemblerImpl(AssemblerInvocation &Opts,
   if (Opts.EmbedBitcode && Ctx.getObjectFileType() == MCContext::IsMachO) {
     MCSection *AsmLabel = Ctx.getMachOSection(
         "__LLVM", "__asm", MachO::S_REGULAR, 4, SectionKind::getReadOnly());
-    Str.get()->SwitchSection(AsmLabel);
+    Str.get()->switchSection(AsmLabel);
     Str.get()->emitZeros(1);
   }
 

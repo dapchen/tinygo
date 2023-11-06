@@ -1,5 +1,4 @@
 //go:build !baremetal
-// +build !baremetal
 
 package machine
 
@@ -58,8 +57,9 @@ type SPIConfig struct {
 	Mode      uint8
 }
 
-func (spi SPI) Configure(config SPIConfig) {
+func (spi SPI) Configure(config SPIConfig) error {
 	spiConfigure(spi.Bus, config.SCK, config.SDO, config.SDI)
+	return nil
 }
 
 // Transfer writes/reads a single byte using the SPI interface.
@@ -108,6 +108,12 @@ func (i2c *I2C) Configure(config I2CConfig) error {
 	return nil
 }
 
+// SetBaudRate sets the I2C frequency.
+func (i2c *I2C) SetBaudRate(br uint32) error {
+	i2cSetBaudRate(i2c.Bus, br)
+	return nil
+}
+
 // Tx does a single I2C transaction at the specified address.
 func (i2c *I2C) Tx(addr uint16, w, r []byte) error {
 	i2cTransfer(i2c.Bus, &w[0], len(w), &r[0], len(r))
@@ -117,6 +123,9 @@ func (i2c *I2C) Tx(addr uint16, w, r []byte) error {
 
 //export __tinygo_i2c_configure
 func i2cConfigure(bus uint8, scl Pin, sda Pin)
+
+//export __tinygo_i2c_set_baud_rate
+func i2cSetBaudRate(bus uint8, br uint32)
 
 //export __tinygo_i2c_transfer
 func i2cTransfer(bus uint8, w *byte, wlen int, r *byte, rlen int) int

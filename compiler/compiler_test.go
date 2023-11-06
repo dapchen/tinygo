@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/tinygo-org/tinygo/compileopts"
+	"github.com/tinygo-org/tinygo/goenv"
 	"github.com/tinygo-org/tinygo/loader"
 	"tinygo.org/x/go-llvm"
 )
@@ -27,6 +28,12 @@ type testCase struct {
 func TestCompiler(t *testing.T) {
 	t.Parallel()
 
+	// Determine Go minor version (e.g. 16 in go1.16.3).
+	_, goMinor, err := goenv.GetGorootVersion()
+	if err != nil {
+		t.Fatal("could not read Go version:", err)
+	}
+
 	// Determine which tests to run, depending on the Go and LLVM versions.
 	tests := []testCase{
 		{"basic.go", "", ""},
@@ -42,6 +49,13 @@ func TestCompiler(t *testing.T) {
 		{"goroutine.go", "cortex-m-qemu", "tasks"},
 		{"channel.go", "", ""},
 		{"gc.go", "", ""},
+		{"zeromap.go", "", ""},
+	}
+	if goMinor >= 20 {
+		tests = append(tests, testCase{"go1.20.go", "", ""})
+	}
+	if goMinor >= 21 {
+		tests = append(tests, testCase{"go1.21.go", "", ""})
 	}
 
 	for _, tc := range tests {
@@ -59,51 +73,11 @@ func TestCompiler(t *testing.T) {
 			options := &compileopts.Options{
 				Target: targetString,
 			}
-			target, err := compileopts.LoadTarget(options)
-			if err != nil {
-				t.Fatal("failed to load target:", err)
-			}
 			if tc.scheduler != "" {
 				options.Scheduler = tc.scheduler
 			}
-			config := &compileopts.Config{
-				Options: options,
-				Target:  target,
-			}
-			compilerConfig := &Config{
-				Triple:             config.Triple(),
-				Features:           config.Features(),
-				GOOS:               config.GOOS(),
-				GOARCH:             config.GOARCH(),
-				CodeModel:          config.CodeModel(),
-				RelocationModel:    config.RelocationModel(),
-				Scheduler:          config.Scheduler(),
-				AutomaticStackSize: config.AutomaticStackSize(),
-				DefaultStackSize:   config.StackSize(),
-				NeedsStackObjects:  config.NeedsStackObjects(),
-			}
-			machine, err := NewTargetMachine(compilerConfig)
-			if err != nil {
-				t.Fatal("failed to create target machine:", err)
-			}
-			defer machine.Dispose()
 
-			// Load entire program AST into memory.
-			lprogram, err := loader.Load(config, "./testdata/"+tc.file, config.ClangHeaders, types.Config{
-				Sizes: Sizes(machine),
-			})
-			if err != nil {
-				t.Fatal("failed to create target machine:", err)
-			}
-			err = lprogram.Parse()
-			if err != nil {
-				t.Fatalf("could not parse test case %s: %s", tc.file, err)
-			}
-
-			// Compile AST to IR.
-			program := lprogram.LoadSSA()
-			pkg := lprogram.MainPkg()
-			mod, errs := CompilePackage(tc.file, pkg, program.Package(pkg.Pkg), machine, compilerConfig, false)
+			mod, errs := testCompilePackage(t, options, tc.file)
 			if errs != nil {
 				for _, err := range errs {
 					t.Error(err)
@@ -111,20 +85,18 @@ func TestCompiler(t *testing.T) {
 				return
 			}
 
-			err = llvm.VerifyModule(mod, llvm.PrintMessageAction)
+			err := llvm.VerifyModule(mod, llvm.PrintMessageAction)
 			if err != nil {
 				t.Error(err)
 			}
 
 			// Optimize IR a little.
-			funcPasses := llvm.NewFunctionPassManagerForModule(mod)
-			defer funcPasses.Dispose()
-			funcPasses.AddInstructionCombiningPass()
-			funcPasses.InitializeFunc()
-			for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
-				funcPasses.RunFunc(fn)
+			passOptions := llvm.NewPassBuilderOptions()
+			defer passOptions.Dispose()
+			err = mod.RunPasses("instcombine", llvm.TargetMachine{}, passOptions)
+			if err != nil {
+				t.Error(err)
 			}
-			funcPasses.FinalizeFunc()
 
 			outFilePrefix := tc.file[:len(tc.file)-3]
 			if tc.target != "" {
@@ -195,12 +167,95 @@ func filterIrrelevantIRLines(lines []string) []string {
 		if strings.HasPrefix(line, "source_filename = ") {
 			continue
 		}
-		if llvmVersion < 14 && strings.HasPrefix(line, "target datalayout = ") {
+		if llvmVersion < 15 && strings.HasPrefix(line, "target datalayout = ") {
 			// The datalayout string may vary betewen LLVM versions.
-			// Right now test outputs are for LLVM 14 and higher.
+			// Right now test outputs are for LLVM 15 and higher.
 			continue
 		}
 		out = append(out, line)
 	}
 	return out
+}
+
+func TestCompilerErrors(t *testing.T) {
+	t.Parallel()
+
+	// Read expected errors from the test file.
+	var expectedErrors []string
+	errorsFile, err := os.ReadFile("testdata/errors.go")
+	if err != nil {
+		t.Error(err)
+	}
+	errorsFileString := strings.ReplaceAll(string(errorsFile), "\r\n", "\n")
+	for _, line := range strings.Split(errorsFileString, "\n") {
+		if strings.HasPrefix(line, "// ERROR: ") {
+			expectedErrors = append(expectedErrors, strings.TrimPrefix(line, "// ERROR: "))
+		}
+	}
+
+	// Compile the Go file with errors.
+	options := &compileopts.Options{
+		Target: "wasm",
+	}
+	_, errs := testCompilePackage(t, options, "errors.go")
+
+	// Check whether the actual errors match the expected errors.
+	expectedErrorsIdx := 0
+	for _, err := range errs {
+		err := err.(types.Error)
+		position := err.Fset.Position(err.Pos)
+		position.Filename = "errors.go" // don't use a full path
+		if expectedErrorsIdx >= len(expectedErrors) || expectedErrors[expectedErrorsIdx] != err.Msg {
+			t.Errorf("unexpected compiler error: %s: %s", position.String(), err.Msg)
+			continue
+		}
+		expectedErrorsIdx++
+	}
+}
+
+// Build a package given a number of compiler options and a file.
+func testCompilePackage(t *testing.T, options *compileopts.Options, file string) (llvm.Module, []error) {
+	target, err := compileopts.LoadTarget(options)
+	if err != nil {
+		t.Fatal("failed to load target:", err)
+	}
+	config := &compileopts.Config{
+		Options: options,
+		Target:  target,
+	}
+	compilerConfig := &Config{
+		Triple:             config.Triple(),
+		Features:           config.Features(),
+		ABI:                config.ABI(),
+		GOOS:               config.GOOS(),
+		GOARCH:             config.GOARCH(),
+		CodeModel:          config.CodeModel(),
+		RelocationModel:    config.RelocationModel(),
+		Scheduler:          config.Scheduler(),
+		AutomaticStackSize: config.AutomaticStackSize(),
+		DefaultStackSize:   config.StackSize(),
+		NeedsStackObjects:  config.NeedsStackObjects(),
+	}
+	machine, err := NewTargetMachine(compilerConfig)
+	if err != nil {
+		t.Fatal("failed to create target machine:", err)
+	}
+	defer machine.Dispose()
+
+	// Load entire program AST into memory.
+	lprogram, err := loader.Load(config, "./testdata/"+file, types.Config{
+		Sizes: Sizes(machine),
+	})
+	if err != nil {
+		t.Fatal("failed to create target machine:", err)
+	}
+	err = lprogram.Parse()
+	if err != nil {
+		t.Fatalf("could not parse test case %s: %s", file, err)
+	}
+
+	// Compile AST to IR.
+	program := lprogram.LoadSSA()
+	pkg := lprogram.MainPkg()
+	return CompilePackage(file, pkg, program.Package(pkg.Pkg), machine, compilerConfig, false)
 }

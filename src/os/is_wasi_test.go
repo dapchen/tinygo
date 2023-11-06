@@ -1,5 +1,4 @@
-//go:build wasi
-// +build wasi
+//go:build wasi || wasip1
 
 package os_test
 

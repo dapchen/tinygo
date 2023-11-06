@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/tinygo-org/tinygo/compileopts"
-	"github.com/tinygo-org/tinygo/goenv"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -59,6 +58,8 @@ func TestClangAttributes(t *testing.T) {
 		{GOOS: "darwin", GOARCH: "amd64"},
 		{GOOS: "darwin", GOARCH: "arm64"},
 		{GOOS: "windows", GOARCH: "amd64"},
+		{GOOS: "windows", GOARCH: "arm64"},
+		{GOOS: "wasip1", GOARCH: "wasm"},
 	} {
 		name := "GOOS=" + options.GOOS + ",GOARCH=" + options.GOARCH
 		if options.GOARCH == "arm" {
@@ -72,7 +73,6 @@ func TestClangAttributes(t *testing.T) {
 
 func testClangAttributes(t *testing.T, options *compileopts.Options) {
 	testDir := t.TempDir()
-	clangHeaderPath := getClangHeaderPath(goenv.Get("TINYGOROOT"))
 
 	ctx := llvm.NewContext()
 	defer ctx.Dispose()
@@ -82,9 +82,8 @@ func testClangAttributes(t *testing.T, options *compileopts.Options) {
 		t.Fatalf("could not load target: %s", err)
 	}
 	config := compileopts.Config{
-		Options:      options,
-		Target:       target,
-		ClangHeaders: clangHeaderPath,
+		Options: options,
+		Target:  target,
 	}
 
 	// Create a very simple C input file.
@@ -96,7 +95,7 @@ func testClangAttributes(t *testing.T, options *compileopts.Options) {
 
 	// Compile this file using Clang.
 	outpath := filepath.Join(testDir, "test.bc")
-	flags := append([]string{"-c", "-emit-llvm", "-o", outpath, srcpath}, config.CFlags()...)
+	flags := append([]string{"-c", "-emit-llvm", "-o", outpath, srcpath}, config.CFlags(false)...)
 	if config.GOOS() == "darwin" {
 		// Silence some warnings that happen when testing GOOS=darwin on
 		// something other than MacOS.

@@ -60,6 +60,7 @@ CXSourceRange tinygo_clang_getCursorExtent(GoCXCursor c);
 CXTranslationUnit tinygo_clang_Cursor_getTranslationUnit(GoCXCursor c);
 long long tinygo_clang_getEnumConstantDeclValue(GoCXCursor c);
 CXType tinygo_clang_getEnumDeclIntegerType(GoCXCursor c);
+unsigned tinygo_clang_Cursor_isAnonymous(GoCXCursor c);
 unsigned tinygo_clang_Cursor_isBitField(GoCXCursor c);
 
 int tinygo_clang_globals_visitor(GoCXCursor c, GoCXCursor parent, CXClientData client_data);
@@ -533,6 +534,26 @@ func tinygo_clang_globals_visitor(c, parent C.GoCXCursor, client_data C.CXClient
 	return C.CXChildVisit_Continue
 }
 
+// Get the precise location in the source code. Used for uniquely identifying
+// source locations.
+func (f *cgoFile) getUniqueLocationID(pos token.Pos, cursor C.GoCXCursor) interface{} {
+	clangLocation := C.tinygo_clang_getCursorLocation(cursor)
+	var file C.CXFile
+	var line C.unsigned
+	var column C.unsigned
+	C.clang_getFileLocation(clangLocation, &file, &line, &column, nil)
+	location := token.Position{
+		Filename: getString(C.clang_getFileName(file)),
+		Line:     int(line),
+		Column:   int(column),
+	}
+	if location.Filename == "" || location.Line == 0 {
+		// Not sure when this would happen, but protect from it anyway.
+		f.addError(pos, "could not find file/line information")
+	}
+	return location
+}
+
 // getCursorPosition returns a usable token.Pos from a libclang cursor.
 func (p *cgoPackage) getCursorPosition(cursor C.GoCXCursor) token.Pos {
 	return p.getClangLocationPosition(C.tinygo_clang_getCursorLocation(cursor), C.tinygo_clang_Cursor_getTranslationUnit(cursor))
@@ -633,8 +654,19 @@ func (p *cgoPackage) addErrorAt(position token.Position, msg string) {
 func (f *cgoFile) makeDecayingASTType(typ C.CXType, pos token.Pos) ast.Expr {
 	// Strip typedefs, if any.
 	underlyingType := typ
+	if underlyingType.kind == C.CXType_Elaborated {
+		// Starting with LLVM 16, the elaborated type is used for more types.
+		// According to the Clang documentation, the elaborated type has no
+		// semantic meaning so can be stripped (it is used to better convey type
+		// name information).
+		// Source:
+		// https://clang.llvm.org/doxygen/classclang_1_1ElaboratedType.html#details
+		// > The type itself is always "sugar", used to express what was written
+		// > in the source code but containing no additional semantic information.
+		underlyingType = C.clang_Type_getNamedType(underlyingType)
+	}
 	if underlyingType.kind == C.CXType_Typedef {
-		c := C.tinygo_clang_getTypeDeclaration(typ)
+		c := C.tinygo_clang_getTypeDeclaration(underlyingType)
 		underlyingType = C.tinygo_clang_getTypedefDeclUnderlyingType(c)
 		// TODO: support a chain of typedefs. At the moment, it seems to get
 		// stuck in an endless loop when trying to get to the most underlying
@@ -768,6 +800,8 @@ func (f *cgoFile) makeASTType(typ C.CXType, pos token.Pos) ast.Expr {
 			return f.makeASTType(underlying, pos)
 		case C.CXType_Enum:
 			return f.makeASTType(underlying, pos)
+		case C.CXType_Typedef:
+			return f.makeASTType(underlying, pos)
 		default:
 			typeKindSpelling := getString(C.clang_getTypeKindSpelling(underlying.kind))
 			f.addError(pos, fmt.Sprintf("unknown elaborated type (libclang type kind %s)", typeKindSpelling))
@@ -786,22 +820,9 @@ func (f *cgoFile) makeASTType(typ C.CXType, pos token.Pos) ast.Expr {
 			// makeASTRecordType will create an appropriate error.
 			cgoRecordPrefix = "record_"
 		}
-		if name == "" {
+		if name == "" || C.tinygo_clang_Cursor_isAnonymous(cursor) != 0 {
 			// Anonymous record, probably inside a typedef.
-			clangLocation := C.tinygo_clang_getCursorLocation(cursor)
-			var file C.CXFile
-			var line C.unsigned
-			var column C.unsigned
-			C.clang_getFileLocation(clangLocation, &file, &line, &column, nil)
-			location := token.Position{
-				Filename: getString(C.clang_getFileName(file)),
-				Line:     int(line),
-				Column:   int(column),
-			}
-			if location.Filename == "" || location.Line == 0 {
-				// Not sure when this would happen, but protect from it anyway.
-				f.addError(pos, "could not find file/line information")
-			}
+			location := f.getUniqueLocationID(pos, cursor)
 			name = f.getUnnamedDeclName("_Ctype_"+cgoRecordPrefix+"__", location)
 		} else {
 			name = cgoRecordPrefix + name
@@ -814,7 +835,9 @@ func (f *cgoFile) makeASTType(typ C.CXType, pos token.Pos) ast.Expr {
 		cursor := C.tinygo_clang_getTypeDeclaration(typ)
 		name := getString(C.tinygo_clang_getCursorSpelling(cursor))
 		if name == "" {
-			name = f.getUnnamedDeclName("_Ctype_enum___", cursor)
+			// Anonymous enum, probably inside a typedef.
+			location := f.getUniqueLocationID(pos, cursor)
+			name = f.getUnnamedDeclName("_Ctype_enum___", location)
 		} else {
 			name = "enum_" + name
 		}

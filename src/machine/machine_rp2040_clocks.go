@@ -1,5 +1,4 @@
 //go:build rp2040
-// +build rp2040
 
 package machine
 
@@ -83,8 +82,8 @@ type clock struct {
 }
 
 // clock returns the clock identified by cix.
-func (clks *clocksType) clock(cix clockIndex) *clock {
-	return &clock{
+func (clks *clocksType) clock(cix clockIndex) clock {
+	return clock{
 		&clks.clk[cix],
 		cix,
 	}
@@ -183,7 +182,7 @@ func (clk *clock) configure(src, auxsrc, srcFreq, freq uint32) {
 // Must be called before any other clock function.
 func (clks *clocksType) init() {
 	// Start the watchdog tick
-	watchdog.startTick(xoscFreq)
+	Watchdog.startTick(xoscFreq)
 
 	// Disable resus that may be enabled from previous software
 	clks.resus.ctrl.Set(0)

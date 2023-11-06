@@ -82,8 +82,12 @@ struct AssemblerInvocation {
   unsigned NoExecStack : 1;
   unsigned FatalWarnings : 1;
   unsigned NoWarn : 1;
+  unsigned NoTypeCheck : 1;
   unsigned IncrementalLinkerCompatible : 1;
   unsigned EmbedBitcode : 1;
+
+  /// Whether to emit DWARF unwind info.
+  EmitDwarfUnwindType EmitDwarfUnwind;
 
   /// The name of the relocation model to use.
   std::string RelocationModel;
@@ -92,6 +96,16 @@ struct AssemblerInvocation {
   /// otherwise.
   std::string TargetABI;
 
+  /// Darwin target variant triple, the variant of the deployment target
+  /// for which the code is being compiled.
+  std::optional<llvm::Triple> DarwinTargetVariantTriple;
+
+  /// The version of the darwin target variant SDK which was used during the
+  /// compilation
+  llvm::VersionTuple DarwinTargetVariantSDKVersion;
+
+  /// The name of a file to use with \c .secure_log_unique directives.
+  std::string AsSecureLogFile;
   /// @}
 
 public:
@@ -108,10 +122,12 @@ public:
     NoExecStack = 0;
     FatalWarnings = 0;
     NoWarn = 0;
+    NoTypeCheck = 0;
     IncrementalLinkerCompatible = 0;
     Dwarf64 = 0;
     DwarfVersion = 0;
     EmbedBitcode = 0;
+    EmitDwarfUnwind = EmitDwarfUnwindType::Default;
   }
 
   static bool CreateFromArgs(AssemblerInvocation &Res,

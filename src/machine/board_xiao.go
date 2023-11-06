@@ -1,5 +1,4 @@
 //go:build sam && atsamd21 && xiao
-// +build sam,atsamd21,xiao
 
 package machine
 
@@ -96,4 +95,8 @@ const (
 var (
 	usb_VID uint16 = 0x2886
 	usb_PID uint16 = 0x802F
+)
+
+var (
+	DefaultUART = UART1
 )

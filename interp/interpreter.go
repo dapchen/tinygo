@@ -238,7 +238,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				// which case this call won't even get to this point but will
 				// already be emitted in initAll.
 				continue
-			case strings.HasPrefix(callFn.name, "runtime.print") || callFn.name == "runtime._panic" || callFn.name == "runtime.hashmapGet" ||
+			case strings.HasPrefix(callFn.name, "runtime.print") || callFn.name == "runtime._panic" || callFn.name == "runtime.hashmapGet" || callFn.name == "runtime.hashmapInterfaceHash" ||
 				callFn.name == "os.runtime_args" || callFn.name == "internal/task.start" || callFn.name == "internal/task.Current":
 				// These functions should be run at runtime. Specifically:
 				//   * Print and panic functions are best emitted directly without
@@ -338,6 +338,20 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 					if err != nil {
 						return nil, mem, r.errorAt(inst, err)
 					}
+					if mem.hasExternalStore(src) || mem.hasExternalLoadOrStore(dst) {
+						// These are the same checks as there are on llvm.Load
+						// and llvm.Store in the interpreter. Copying is
+						// essentially loading from the source array and storing
+						// to the destination array, hence why we need to do the
+						// same checks here.
+						// This fixes the following bug:
+						// https://github.com/tinygo-org/tinygo/issues/3890
+						err := r.runAtRuntime(fn, inst, locals, &mem, indent)
+						if err != nil {
+							return nil, mem, err
+						}
+						continue
+					}
 					nBytes := uint32(n * elemSize)
 					dstObj := mem.getWritable(dst.index())
 					dstBuf := dstObj.buffer.asRawValue(r)
@@ -346,17 +360,8 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 					dstObj.buffer = dstBuf
 					mem.put(dst.index(), dstObj)
 				}
-				switch inst.llvmInst.Type().IntTypeWidth() {
-				case 16:
-					locals[inst.localIndex] = literalValue{uint16(n)}
-				case 32:
-					locals[inst.localIndex] = literalValue{uint32(n)}
-				case 64:
-					locals[inst.localIndex] = literalValue{uint64(n)}
-				default:
-					panic("unknown integer type width")
-				}
-			case strings.HasPrefix(callFn.name, "llvm.memcpy.p0i8.p0i8.") || strings.HasPrefix(callFn.name, "llvm.memmove.p0i8.p0i8."):
+				locals[inst.localIndex] = makeLiteralInt(n, inst.llvmInst.Type().IntTypeWidth())
+			case strings.HasPrefix(callFn.name, "llvm.memcpy.p0") || strings.HasPrefix(callFn.name, "llvm.memmove.p0"):
 				// Copy a block of memory from one pointer to another.
 				dst, err := operands[1].asPointer(r)
 				if err != nil {
@@ -378,42 +383,6 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				copy(dstBuf.buf[dst.offset():dst.offset()+nBytes], srcBuf.buf[src.offset():])
 				dstObj.buffer = dstBuf
 				mem.put(dst.index(), dstObj)
-			case callFn.name == "(reflect.rawType).elem":
-				if r.debug {
-					fmt.Fprintln(os.Stderr, indent+"call (reflect.rawType).elem:", operands[1:])
-				}
-				// Extract the type code global from the first parameter.
-				typecodeIDPtrToInt, err := operands[1].toLLVMValue(inst.llvmInst.Operand(0).Type(), &mem)
-				if err != nil {
-					return nil, mem, r.errorAt(inst, err)
-				}
-				typecodeID := typecodeIDPtrToInt.Operand(0)
-
-				// Get the type class.
-				// See also: getClassAndValueFromTypeCode in transform/reflect.go.
-				typecodeName := typecodeID.Name()
-				const prefix = "reflect/types.type:"
-				if !strings.HasPrefix(typecodeName, prefix) {
-					panic("unexpected typecode name: " + typecodeName)
-				}
-				id := typecodeName[len(prefix):]
-				class := id[:strings.IndexByte(id, ':')]
-				value := id[len(class)+1:]
-				if class == "named" {
-					// Get the underlying type.
-					class = value[:strings.IndexByte(value, ':')]
-					value = value[len(class)+1:]
-				}
-
-				// Elem() is only valid for certain type classes.
-				switch class {
-				case "chan", "pointer", "slice", "array":
-					elementType := llvm.ConstExtractValue(typecodeID.Initializer(), []uint32{0})
-					uintptrType := r.mod.Context().IntType(int(mem.r.pointerSize) * 8)
-					locals[inst.localIndex] = r.getValue(llvm.ConstPtrToInt(elementType, uintptrType))
-				default:
-					return nil, mem, r.errorAt(inst, fmt.Errorf("(reflect.Type).Elem() called on %s type", class))
-				}
 			case callFn.name == "runtime.typeAssert":
 				// This function must be implemented manually as it is normally
 				// implemented by the interface lowering pass.
@@ -424,15 +393,22 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				if err != nil {
 					return nil, mem, r.errorAt(inst, err)
 				}
-				actualTypePtrToInt, err := operands[1].toLLVMValue(inst.llvmInst.Operand(0).Type(), &mem)
+				actualType, err := operands[1].toLLVMValue(inst.llvmInst.Operand(0).Type(), &mem)
 				if err != nil {
 					return nil, mem, r.errorAt(inst, err)
 				}
-				if !actualTypePtrToInt.IsAConstantInt().IsNil() && actualTypePtrToInt.ZExtValue() == 0 {
+				if !actualType.IsAConstantInt().IsNil() && actualType.ZExtValue() == 0 {
 					locals[inst.localIndex] = literalValue{uint8(0)}
 					break
 				}
-				actualType := actualTypePtrToInt.Operand(0)
+				// Strip pointer casts (bitcast, getelementptr).
+				for !actualType.IsAConstantExpr().IsNil() {
+					opcode := actualType.Opcode()
+					if opcode != llvm.GetElementPtr && opcode != llvm.BitCast {
+						break
+					}
+					actualType = actualType.Operand(0)
+				}
 				if strings.TrimPrefix(actualType.Name(), "reflect/types.type:") == strings.TrimPrefix(assertedType.Name(), "reflect/types.typeid:") {
 					locals[inst.localIndex] = literalValue{uint8(1)}
 				} else {
@@ -448,11 +424,12 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				if err != nil {
 					return nil, mem, r.errorAt(inst, err)
 				}
-				methodSetPtr, err := mem.load(typecodePtr.addOffset(r.pointerSize*2), r.pointerSize).asPointer(r)
+				methodSetPtr, err := mem.load(typecodePtr.addOffset(-int64(r.pointerSize)), r.pointerSize).asPointer(r)
 				if err != nil {
 					return nil, mem, r.errorAt(inst, err)
 				}
 				methodSet := mem.get(methodSetPtr.index()).llvmGlobal.Initializer()
+				numMethods := int(r.builder.CreateExtractValue(methodSet, 0, "").ZExtValue())
 				llvmFn := inst.llvmInst.CalledValue()
 				methodSetAttr := llvmFn.GetStringAttributeAtIndex(-1, "tinygo-methods")
 				methodSetString := methodSetAttr.GetStringValue()
@@ -460,9 +437,9 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				// Make a set of all the methods on the concrete type, for
 				// easier checking in the next step.
 				concreteTypeMethods := map[string]struct{}{}
-				for i := 0; i < methodSet.Type().ArrayLength(); i++ {
-					methodInfo := llvm.ConstExtractValue(methodSet, []uint32{uint32(i)})
-					name := llvm.ConstExtractValue(methodInfo, []uint32{0}).Name()
+				for i := 0; i < numMethods; i++ {
+					methodInfo := r.builder.CreateExtractValue(methodSet, 1, "")
+					name := r.builder.CreateExtractValue(methodInfo, i, "").Name()
 					concreteTypeMethods[name] = struct{}{}
 				}
 
@@ -488,15 +465,16 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 					fmt.Fprintln(os.Stderr, indent+"invoke method:", operands[1:])
 				}
 
-				// Load the type code of the interface value.
-				typecodeIDBitCast, err := operands[len(operands)-2].toLLVMValue(inst.llvmInst.Operand(len(operands)-3).Type(), &mem)
+				// Load the type code and method set of the interface value.
+				typecodePtr, err := operands[len(operands)-2].asPointer(r)
 				if err != nil {
 					return nil, mem, r.errorAt(inst, err)
 				}
-				typecodeID := typecodeIDBitCast.Operand(0).Initializer()
-
-				// Load the method set, which is part of the typecodeID object.
-				methodSet := llvm.ConstExtractValue(typecodeID, []uint32{2}).Operand(0).Initializer()
+				methodSetPtr, err := mem.load(typecodePtr.addOffset(-int64(r.pointerSize)), r.pointerSize).asPointer(r)
+				if err != nil {
+					return nil, mem, r.errorAt(inst, err)
+				}
+				methodSet := mem.get(methodSetPtr.index()).llvmGlobal.Initializer()
 
 				// We don't need to load the interface method set.
 
@@ -508,12 +486,14 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 
 				// Iterate through all methods, looking for the one method that
 				// should be returned.
-				numMethods := methodSet.Type().ArrayLength()
+				numMethods := int(r.builder.CreateExtractValue(methodSet, 0, "").ZExtValue())
 				var method llvm.Value
 				for i := 0; i < numMethods; i++ {
-					methodSignature := llvm.ConstExtractValue(methodSet, []uint32{uint32(i), 0})
+					methodSignatureAgg := r.builder.CreateExtractValue(methodSet, 1, "")
+					methodSignature := r.builder.CreateExtractValue(methodSignatureAgg, i, "")
 					if methodSignature == signature {
-						method = llvm.ConstExtractValue(methodSet, []uint32{uint32(i), 1}).Operand(0)
+						methodAgg := r.builder.CreateExtractValue(methodSet, 2, "")
+						method = r.builder.CreateExtractValue(methodAgg, i, "")
 					}
 				}
 				if method.IsNil() {
@@ -563,7 +543,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 					// how this function got called.
 					callErr.Traceback = append(callErr.Traceback, ErrorLine{
 						Pos:  getPosition(inst.llvmInst),
-						Inst: inst.llvmInst,
+						Inst: inst.llvmInst.String(),
 					})
 					return nil, mem, callErr
 				}
@@ -636,7 +616,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			// Create the new object.
 			size := operands[0].(literalValue).value.(uint64)
 			alloca := object{
-				llvmType:   inst.llvmInst.Type(),
+				llvmType:   inst.llvmInst.AllocatedType(),
 				globalName: r.pkgName + "$alloca",
 				buffer:     newRawValue(uint32(size)),
 				size:       uint32(size),
@@ -654,7 +634,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			// GetElementPtr does pointer arithmetic, changing the offset of the
 			// pointer into the underlying object.
 			var offset uint64
-			for i := 2; i < len(operands); i += 2 {
+			for i := 1; i < len(operands); i += 2 {
 				index := operands[i].Uint()
 				elementSize := operands[i+1].Uint()
 				if int64(elementSize) < 0 {
@@ -672,19 +652,10 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 				}
 				// GEP on fixed pointer value (for example, memory-mapped I/O).
 				ptrValue := operands[0].Uint() + offset
-				switch operands[0].len(r) {
-				case 8:
-					locals[inst.localIndex] = literalValue{uint64(ptrValue)}
-				case 4:
-					locals[inst.localIndex] = literalValue{uint32(ptrValue)}
-				case 2:
-					locals[inst.localIndex] = literalValue{uint16(ptrValue)}
-				default:
-					panic("pointer operand is not of a known pointer size")
-				}
+				locals[inst.localIndex] = makeLiteralInt(ptrValue, int(operands[0].len(r)*8))
 				continue
 			}
-			ptr = ptr.addOffset(uint32(offset))
+			ptr = ptr.addOffset(int64(offset))
 			locals[inst.localIndex] = ptr
 			if r.debug {
 				fmt.Fprintln(os.Stderr, indent+"gep:", operands, "->", ptr)
@@ -722,46 +693,9 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			locals[inst.localIndex] = newagg
 		case llvm.ICmp:
 			predicate := llvm.IntPredicate(operands[2].(literalValue).value.(uint8))
-			var result bool
 			lhs := operands[0]
 			rhs := operands[1]
-			switch predicate {
-			case llvm.IntEQ, llvm.IntNE:
-				lhsPointer, lhsErr := lhs.asPointer(r)
-				rhsPointer, rhsErr := rhs.asPointer(r)
-				if (lhsErr == nil) != (rhsErr == nil) {
-					// Fast path: only one is a pointer, so they can't be equal.
-					result = false
-				} else if lhsErr == nil {
-					// Both must be nil, so both are pointers.
-					// Compare them directly.
-					result = lhsPointer.equal(rhsPointer)
-				} else {
-					// Fall back to generic comparison.
-					result = lhs.asRawValue(r).equal(rhs.asRawValue(r))
-				}
-				if predicate == llvm.IntNE {
-					result = !result
-				}
-			case llvm.IntUGT:
-				result = lhs.Uint() > rhs.Uint()
-			case llvm.IntUGE:
-				result = lhs.Uint() >= rhs.Uint()
-			case llvm.IntULT:
-				result = lhs.Uint() < rhs.Uint()
-			case llvm.IntULE:
-				result = lhs.Uint() <= rhs.Uint()
-			case llvm.IntSGT:
-				result = lhs.Int() > rhs.Int()
-			case llvm.IntSGE:
-				result = lhs.Int() >= rhs.Int()
-			case llvm.IntSLT:
-				result = lhs.Int() < rhs.Int()
-			case llvm.IntSLE:
-				result = lhs.Int() <= rhs.Int()
-			default:
-				return nil, mem, r.errorAt(inst, errors.New("interp: unsupported icmp"))
-			}
+			result := r.interpretICmp(lhs, rhs, predicate)
 			if result {
 				locals[inst.localIndex] = literalValue{uint8(1)}
 			} else {
@@ -816,30 +750,33 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			if err == nil {
 				// The lhs is a pointer. This sometimes happens for particular
 				// pointer tricks.
-				switch inst.opcode {
-				case llvm.Add:
+				if inst.opcode == llvm.Add {
 					// This likely means this is part of a
 					// unsafe.Pointer(uintptr(ptr) + offset) pattern.
-					lhsPtr = lhsPtr.addOffset(uint32(rhs.Uint()))
+					lhsPtr = lhsPtr.addOffset(int64(rhs.Uint()))
 					locals[inst.localIndex] = lhsPtr
-					continue
-				case llvm.Xor:
-					if rhs.Uint() == 0 {
-						// Special workaround for strings.noescape, see
-						// src/strings/builder.go in the Go source tree. This is
-						// the identity operator, so we can return the input.
-						locals[inst.localIndex] = lhs
-						continue
-					}
-				default:
+				} else if inst.opcode == llvm.Xor && rhs.Uint() == 0 {
+					// Special workaround for strings.noescape, see
+					// src/strings/builder.go in the Go source tree. This is
+					// the identity operator, so we can return the input.
+					locals[inst.localIndex] = lhs
+				} else if inst.opcode == llvm.And && rhs.Uint() < 8 {
+					// This is probably part of a pattern to get the lower bits
+					// of a pointer for pointer tagging, like this:
+					//     uintptr(unsafe.Pointer(t)) & 0b11
+					// We can actually support this easily by ANDing with the
+					// pointer offset.
+					result := uint64(lhsPtr.offset()) & rhs.Uint()
+					locals[inst.localIndex] = makeLiteralInt(result, int(lhs.len(r)*8))
+				} else {
 					// Catch-all for weird operations that should just be done
 					// at runtime.
 					err := r.runAtRuntime(fn, inst, locals, &mem, indent)
 					if err != nil {
 						return nil, mem, err
 					}
-					continue
 				}
+				continue
 			}
 			var result uint64
 			switch inst.opcode {
@@ -872,18 +809,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			default:
 				panic("unreachable")
 			}
-			switch lhs.len(r) {
-			case 8:
-				locals[inst.localIndex] = literalValue{result}
-			case 4:
-				locals[inst.localIndex] = literalValue{uint32(result)}
-			case 2:
-				locals[inst.localIndex] = literalValue{uint16(result)}
-			case 1:
-				locals[inst.localIndex] = literalValue{uint8(result)}
-			default:
-				panic("unknown integer size")
-			}
+			locals[inst.localIndex] = makeLiteralInt(result, int(lhs.len(r)*8))
 			if r.debug {
 				fmt.Fprintln(os.Stderr, indent+instructionNameMap[inst.opcode]+":", lhs, rhs, "->", result)
 			}
@@ -905,18 +831,7 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 			if r.debug {
 				fmt.Fprintln(os.Stderr, indent+instructionNameMap[inst.opcode]+":", value, bitwidth)
 			}
-			switch bitwidth {
-			case 64:
-				locals[inst.localIndex] = literalValue{value}
-			case 32:
-				locals[inst.localIndex] = literalValue{uint32(value)}
-			case 16:
-				locals[inst.localIndex] = literalValue{uint16(value)}
-			case 8:
-				locals[inst.localIndex] = literalValue{uint8(value)}
-			default:
-				panic("unknown integer size in sext/zext/trunc")
-			}
+			locals[inst.localIndex] = makeLiteralInt(value, int(bitwidth))
 		case llvm.SIToFP, llvm.UIToFP:
 			var value float64
 			switch inst.opcode {
@@ -945,6 +860,51 @@ func (r *runner) run(fn *function, params []value, parentMem *memoryView, indent
 		}
 	}
 	return nil, mem, r.errorAt(bb.instructions[len(bb.instructions)-1], errors.New("interp: reached end of basic block without terminator"))
+}
+
+// Interpret an icmp instruction. Doesn't have side effects, only returns the
+// output of the comparison.
+func (r *runner) interpretICmp(lhs, rhs value, predicate llvm.IntPredicate) bool {
+	switch predicate {
+	case llvm.IntEQ, llvm.IntNE:
+		var result bool
+		lhsPointer, lhsErr := lhs.asPointer(r)
+		rhsPointer, rhsErr := rhs.asPointer(r)
+		if (lhsErr == nil) != (rhsErr == nil) {
+			// Fast path: only one is a pointer, so they can't be equal.
+			result = false
+		} else if lhsErr == nil {
+			// Both must be nil, so both are pointers.
+			// Compare them directly.
+			result = lhsPointer.equal(rhsPointer)
+		} else {
+			// Fall back to generic comparison.
+			result = lhs.asRawValue(r).equal(rhs.asRawValue(r))
+		}
+		if predicate == llvm.IntNE {
+			result = !result
+		}
+		return result
+	case llvm.IntUGT:
+		return lhs.Uint() > rhs.Uint()
+	case llvm.IntUGE:
+		return lhs.Uint() >= rhs.Uint()
+	case llvm.IntULT:
+		return lhs.Uint() < rhs.Uint()
+	case llvm.IntULE:
+		return lhs.Uint() <= rhs.Uint()
+	case llvm.IntSGT:
+		return lhs.Int() > rhs.Int()
+	case llvm.IntSGE:
+		return lhs.Int() >= rhs.Int()
+	case llvm.IntSLT:
+		return lhs.Int() < rhs.Int()
+	case llvm.IntSLE:
+		return lhs.Int() <= rhs.Int()
+	default:
+		// _should_ be unreachable, until LLVM adds new icmp operands (unlikely)
+		panic("interp: unsupported icmp")
+	}
 }
 
 func (r *runner) runAtRuntime(fn *function, inst instruction, locals []value, mem *memoryView, indent string) *Error {
@@ -977,13 +937,13 @@ func (r *runner) runAtRuntime(fn *function, inst instruction, locals []value, me
 				}
 			}
 		}
-		result = r.builder.CreateCall(llvmFn, args, inst.name)
+		result = r.builder.CreateCall(inst.llvmInst.CalledFunctionType(), llvmFn, args, inst.name)
 	case llvm.Load:
 		err := mem.markExternalLoad(operands[0])
 		if err != nil {
 			return r.errorAt(inst, err)
 		}
-		result = r.builder.CreateLoad(operands[0], inst.name)
+		result = r.builder.CreateLoad(inst.llvmInst.Type(), operands[0], inst.name)
 		if inst.llvmInst.IsVolatile() {
 			result.SetVolatile(true)
 		}

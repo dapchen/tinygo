@@ -1,11 +1,10 @@
 //go:build gc.none
-// +build gc.none
 
 package runtime
 
 // This GC strategy provides no memory allocation at all. It can be useful to
-// detect where in a program memory is allocated, or to combine this runtime
-// with a separate (external) garbage collector.
+// detect where in a program memory is allocated (via linker errors) or for
+// targets that have far too little RAM even for the leaking memory allocator.
 
 import (
 	"unsafe"
@@ -27,10 +26,6 @@ func GC() {
 	// Unimplemented.
 }
 
-func KeepAlive(x interface{}) {
-	// Unimplemented. Only required with SetFinalizer().
-}
-
 func SetFinalizer(obj interface{}, finalizer interface{}) {
 	// Unimplemented.
 }
@@ -41,8 +36,4 @@ func initHeap() {
 
 func setHeapEnd(newHeapEnd uintptr) {
 	// Nothing to do here, this function is never actually called.
-}
-
-func markRoots(start, end uintptr) {
-	// dummy, so that markGlobals will compile
 }

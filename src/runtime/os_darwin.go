@@ -1,9 +1,10 @@
 //go:build darwin
-// +build darwin
 
 package runtime
 
 import "unsafe"
+
+import "C" // dummy import so that os_darwin.c works
 
 const GOOS = "darwin"
 
@@ -53,12 +54,12 @@ type segmentLoadCommand struct {
 //go:extern _mh_execute_header
 var libc_mh_execute_header machHeader
 
-// Mark global variables.
+// Find global variables in .data/.bss sections.
 // The MachO linker doesn't seem to provide symbols for the start and end of the
 // data section. There is get_etext, get_edata, and get_end, but these are
 // undocumented and don't work with ASLR (which is enabled by default).
 // Therefore, read the MachO header directly.
-func markGlobals() {
+func findGlobals(found func(start, end uintptr)) {
 	// Here is a useful blog post to understand the MachO file format:
 	// https://h3adsh0tzz.com/2020/01/macho-file-format/
 
@@ -102,12 +103,12 @@ func markGlobals() {
 				// This could be improved by only reading the memory areas
 				// covered by sections. That would reduce the amount of memory
 				// scanned a little bit (up to a single VM page).
-				markRoots(offset+cmd.vmaddr, offset+cmd.vmaddr+cmd.vmsize)
+				found(offset+cmd.vmaddr, offset+cmd.vmaddr+cmd.vmsize)
 			}
 		}
 
 		// Move on to the next load command (wich may or may not be a
 		// LC_SEGMENT_64).
-		cmd = (*segmentLoadCommand)(unsafe.Pointer(uintptr(unsafe.Pointer(cmd)) + uintptr(cmd.cmdsize)))
+		cmd = (*segmentLoadCommand)(unsafe.Add(unsafe.Pointer(cmd), cmd.cmdsize))
 	}
 }

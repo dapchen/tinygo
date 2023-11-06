@@ -86,6 +86,9 @@ var cgoAliases = map[string]string{
 	"C.uint32_t":  "uint32",
 	"C.uint64_t":  "uint64",
 	"C.uintptr_t": "uintptr",
+	"C.float":     "float32",
+	"C.double":    "float64",
+	"C._Bool":     "bool",
 }
 
 // builtinAliases are handled specially because they only exist on the Go side
@@ -162,7 +165,7 @@ func GoBytes(ptr unsafe.Pointer, length C.int) []byte {
 // functions), the CFLAGS and LDFLAGS found in #cgo lines, and a map of file
 // hashes of the accessed C header files. If there is one or more error, it
 // returns these in the []error slice but still modifies the AST.
-func Process(files []*ast.File, dir, importPath string, fset *token.FileSet, cflags []string, clangHeaders string) (*ast.File, []string, []string, []string, map[string][]byte, []error) {
+func Process(files []*ast.File, dir, importPath string, fset *token.FileSet, cflags []string) (*ast.File, []string, []string, []string, map[string][]byte, []error) {
 	p := &cgoPackage{
 		currentDir:      dir,
 		importPath:      importPath,
@@ -289,9 +292,6 @@ func Process(files []*ast.File, dir, importPath string, fset *token.FileSet, cfl
 	// have better alternatives anyway.
 	cflagsForCGo := append([]string{"-D_FORTIFY_SOURCE=0"}, cflags...)
 	cflagsForCGo = append(cflagsForCGo, p.cflags...)
-	if clangHeaders != "" {
-		cflagsForCGo = append(cflagsForCGo, "-isystem", clangHeaders)
-	}
 
 	// Retrieve types such as C.int, C.longlong, etc from C.
 	p.newCGoFile(nil, -1).readNames(builtinAliasTypedefs, cflagsForCGo, "", func(names map[string]clangCursor) {
@@ -309,6 +309,13 @@ func Process(files []*ast.File, dir, importPath string, fset *token.FileSet, cfl
 	// Process CGo imports for each file.
 	for i, f := range files {
 		cf := p.newCGoFile(f, i)
+		// These types are aliased with the corresponding types in C. For
+		// example, float in C is always float32 in Go.
+		cf.names["float"] = clangCursor{}
+		cf.names["double"] = clangCursor{}
+		cf.names["_Bool"] = clangCursor{}
+		// Now read all the names (identifies) that C defines in the header
+		// snippet.
 		cf.readNames(p.cgoHeaders[i], cflagsForCGo, filepath.Base(fset.File(f.Pos()).Name()), func(names map[string]clangCursor) {
 			for _, name := range builtinAliases {
 				// Names such as C.int should not be obtained from C.

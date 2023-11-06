@@ -1,5 +1,4 @@
 //go:build rp2040
-// +build rp2040
 
 package machine
 
@@ -10,7 +9,7 @@ import (
 	"unsafe"
 )
 
-type io struct {
+type ioType struct {
 	status volatile.Register32
 	ctrl   volatile.Register32
 }
@@ -22,7 +21,7 @@ type irqCtrl struct {
 }
 
 type ioBank0Type struct {
-	io                 [30]io
+	io                 [30]ioType
 	intR               [4]volatile.Register32
 	proc0IRQctrl       irqCtrl
 	proc1IRQctrl       irqCtrl
@@ -86,6 +85,8 @@ const (
 	PinPWM
 	PinI2C
 	PinSPI
+	PinPIO0
+	PinPIO1
 )
 
 func (p Pin) PortMaskSet() (*uint32, uint32) {
@@ -173,6 +174,9 @@ func (p Pin) init() {
 
 // Configure configures the gpio pin as per mode.
 func (p Pin) Configure(config PinConfig) {
+	if p == NoPin {
+		return
+	}
 	p.init()
 	mask := uint32(1) << p
 	switch config.Mode {
@@ -203,11 +207,18 @@ func (p Pin) Configure(config PinConfig) {
 		p.setSlew(false)
 	case PinSPI:
 		p.setFunc(fnSPI)
+	case PinPIO0:
+		p.setFunc(fnPIO0)
+	case PinPIO1:
+		p.setFunc(fnPIO1)
 	}
 }
 
 // Set drives the pin high if value is true else drives it low.
 func (p Pin) Set(value bool) {
+	if p == NoPin {
+		return
+	}
 	if value {
 		p.set()
 	} else {
@@ -246,6 +257,9 @@ var (
 // nil func to unset the pin change interrupt. If you do so, the change
 // parameter is ignored and can be set to any value (such as 0).
 func (p Pin) SetInterrupt(change PinChange, callback func(Pin)) error {
+	if p == NoPin {
+		return nil
+	}
 	if p > 31 || p < 0 {
 		return ErrInvalidInputPin
 	}
@@ -288,8 +302,8 @@ func gpioHandleInterrupt(intr interrupt.Interrupt) {
 			base = &ioBank0.proc1IRQctrl
 		}
 
-		statreg := base.intS[gpio>>3]
-		change := getIntChange(gpio, statreg.Get())
+		statreg := base.intS[gpio>>3].Get()
+		change := getIntChange(gpio, statreg)
 		if change != 0 {
 			gpio.acknowledgeInterrupt(change)
 			callback := pinCallbacks[core][gpio]

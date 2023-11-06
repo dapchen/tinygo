@@ -42,8 +42,8 @@ type BuildResult struct {
 	// information. Used for GDB for example.
 	Executable string
 
-	// A path to the output binary. It will be removed after Build returns, so
-	// if it should be kept it must be copied or moved away.
+	// A path to the output binary. It is stored in the tmpdir directory of the
+	// Build function, so if it should be kept it must be copied or moved away.
 	// It is often the same as Executable, but differs if the output format is
 	// .hex for example (instead of the usual ELF).
 	Binary string
@@ -83,8 +83,7 @@ type packageAction struct {
 	FileHashes       map[string]string // hash of every file that's part of the package
 	EmbeddedFiles    map[string]string // hash of all the //go:embed files in the package
 	Imports          map[string]string // map from imported package to action ID hash
-	OptLevel         int               // LLVM optimization level (0-3)
-	SizeLevel        int               // LLVM optimization for size level (0-2)
+	OptLevel         string            // LLVM optimization level (O0, O1, O2, Os, Oz)
 	UndefinedGlobals []string          // globals that are left as external globals (no initializer)
 }
 
@@ -94,23 +93,16 @@ type packageAction struct {
 //
 // The error value may be of type *MultiError. Callers will likely want to check
 // for this case and print such errors individually.
-func Build(pkgName, outpath string, config *compileopts.Config, action func(BuildResult) error) error {
+func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildResult, error) {
 	// Read the build ID of the tinygo binary.
 	// Used as a cache key for package builds.
 	compilerBuildID, err := ReadBuildID()
 	if err != nil {
-		return err
+		return BuildResult{}, err
 	}
 
-	// Create a temporary directory for intermediary files.
-	dir, err := os.MkdirTemp("", "tinygo")
-	if err != nil {
-		return err
-	}
 	if config.Options.Work {
-		fmt.Printf("WORK=%s\n", dir)
-	} else {
-		defer os.RemoveAll(dir)
+		fmt.Printf("WORK=%s\n", tmpdir)
 	}
 
 	// Look up the build cache directory, which is used to speed up incremental
@@ -119,7 +111,31 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	if cacheDir == "off" {
 		// Use temporary build directory instead, effectively disabling the
 		// build cache.
-		cacheDir = dir
+		cacheDir = tmpdir
+	}
+
+	// Create default global values.
+	globalValues := map[string]map[string]string{
+		"runtime": {
+			"buildVersion": goenv.Version(),
+		},
+		"testing": {},
+	}
+	if config.TestConfig.CompileTestBinary {
+		// The testing.testBinary is set to "1" when in a test.
+		// This is needed for testing.Testing() to work correctly.
+		globalValues["testing"]["testBinary"] = "1"
+	}
+
+	// Copy over explicitly set global values, like
+	// -ldflags="-X main.Version="1.0"
+	for pkgPath, vals := range config.Options.GlobalValues {
+		if _, ok := globalValues[pkgPath]; !ok {
+			globalValues[pkgPath] = map[string]string{}
+		}
+		for k, v := range vals {
+			globalValues[pkgPath][k] = v
+		}
 	}
 
 	// Check for a libc dependency.
@@ -129,58 +145,60 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	var libcDependencies []*compileJob
 	switch config.Target.Libc {
 	case "darwin-libSystem":
-		job := makeDarwinLibSystemJob(config, dir)
+		job := makeDarwinLibSystemJob(config, tmpdir)
 		libcDependencies = append(libcDependencies, job)
 	case "musl":
-		job, unlock, err := Musl.load(config, dir)
+		job, unlock, err := Musl.load(config, tmpdir)
 		if err != nil {
-			return err
+			return BuildResult{}, err
 		}
 		defer unlock()
 		libcDependencies = append(libcDependencies, dummyCompileJob(filepath.Join(filepath.Dir(job.result), "crt1.o")))
 		libcDependencies = append(libcDependencies, job)
 	case "picolibc":
-		libcJob, unlock, err := Picolibc.load(config, dir)
+		libcJob, unlock, err := Picolibc.load(config, tmpdir)
 		if err != nil {
-			return err
+			return BuildResult{}, err
 		}
 		defer unlock()
 		libcDependencies = append(libcDependencies, libcJob)
 	case "wasi-libc":
 		path := filepath.Join(root, "lib/wasi-libc/sysroot/lib/wasm32-wasi/libc.a")
 		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
-			return errors.New("could not find wasi-libc, perhaps you need to run `make wasi-libc`?")
+			return BuildResult{}, errors.New("could not find wasi-libc, perhaps you need to run `make wasi-libc`?")
 		}
 		libcDependencies = append(libcDependencies, dummyCompileJob(path))
 	case "mingw-w64":
-		_, unlock, err := MinGW.load(config, dir)
+		_, unlock, err := MinGW.load(config, tmpdir)
 		if err != nil {
-			return err
+			return BuildResult{}, err
 		}
 		unlock()
-		libcDependencies = append(libcDependencies, makeMinGWExtraLibs(dir)...)
+		libcDependencies = append(libcDependencies, makeMinGWExtraLibs(tmpdir, config.GOARCH())...)
 	case "":
 		// no library specified, so nothing to do
 	default:
-		return fmt.Errorf("unknown libc: %s", config.Target.Libc)
+		return BuildResult{}, fmt.Errorf("unknown libc: %s", config.Target.Libc)
 	}
 
-	optLevel, sizeLevel, _ := config.OptLevels()
+	optLevel, speedLevel, sizeLevel := config.OptLevel()
 	compilerConfig := &compiler.Config{
 		Triple:          config.Triple(),
 		CPU:             config.CPU(),
 		Features:        config.Features(),
+		ABI:             config.ABI(),
 		GOOS:            config.GOOS(),
 		GOARCH:          config.GOARCH(),
 		CodeModel:       config.CodeModel(),
 		RelocationModel: config.RelocationModel(),
 		SizeLevel:       sizeLevel,
+		TinyGoVersion:   goenv.Version(),
 
 		Scheduler:          config.Scheduler(),
 		AutomaticStackSize: config.AutomaticStackSize(),
 		DefaultStackSize:   config.StackSize(),
 		NeedsStackObjects:  config.NeedsStackObjects(),
-		Debug:              true,
+		Debug:              !config.Options.SkipDWARF, // emit DWARF except when -internal-nodwarf is passed
 	}
 
 	// Load the target machine, which is the LLVM object that contains all
@@ -188,20 +206,29 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	// address spaces, etc).
 	machine, err := compiler.NewTargetMachine(compilerConfig)
 	if err != nil {
-		return err
+		return BuildResult{}, err
 	}
 	defer machine.Dispose()
 
 	// Load entire program AST into memory.
-	lprogram, err := loader.Load(config, pkgName, config.ClangHeaders, types.Config{
+	lprogram, err := loader.Load(config, pkgName, types.Config{
 		Sizes: compiler.Sizes(machine),
 	})
 	if err != nil {
-		return err
+		return BuildResult{}, err
+	}
+	result := BuildResult{
+		ModuleRoot: lprogram.MainPkg().Module.Dir,
+		MainDir:    lprogram.MainPkg().Dir,
+		ImportPath: lprogram.MainPkg().ImportPath,
+	}
+	if result.ModuleRoot == "" {
+		// If there is no module root, just the regular root.
+		result.ModuleRoot = lprogram.MainPkg().Root
 	}
 	err = lprogram.Parse()
 	if err != nil {
-		return err
+		return result, err
 	}
 
 	// Create the *ssa.Program. This does not yet build the entire SSA of the
@@ -213,26 +240,12 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	var packageJobs []*compileJob
 	packageActionIDJobs := make(map[string]*compileJob)
 
-	if config.Options.GlobalValues["runtime"]["buildVersion"] == "" {
-		version := goenv.Version
-		if strings.HasSuffix(goenv.Version, "-dev") && goenv.GitSha1 != "" {
-			version += "-" + goenv.GitSha1
-		}
-		if config.Options.GlobalValues == nil {
-			config.Options.GlobalValues = make(map[string]map[string]string)
-		}
-		if config.Options.GlobalValues["runtime"] == nil {
-			config.Options.GlobalValues["runtime"] = make(map[string]string)
-		}
-		config.Options.GlobalValues["runtime"]["buildVersion"] = version
-	}
-
 	var embedFileObjects []*compileJob
 	for _, pkg := range lprogram.Sorted() {
 		pkg := pkg // necessary to avoid a race condition
 
 		var undefinedGlobals []string
-		for name := range config.Options.GlobalValues[pkg.Pkg.Path()] {
+		for name := range globalValues[pkg.Pkg.Path()] {
 			undefinedGlobals = append(undefinedGlobals, name)
 		}
 		sort.Strings(undefinedGlobals)
@@ -270,7 +283,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 						}
 					}
 
-					job.result, err = createEmbedObjectFile(string(data), hexSum, name, pkg.OriginalDir(), dir, compilerConfig)
+					job.result, err = createEmbedObjectFile(string(data), hexSum, name, pkg.OriginalDir(), tmpdir, compilerConfig)
 					return err
 				},
 			}
@@ -284,7 +297,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 		for _, imported := range pkg.Pkg.Imports() {
 			job, ok := packageActionIDJobs[imported.Path()]
 			if !ok {
-				return fmt.Errorf("package %s imports %s but couldn't find dependency", pkg.ImportPath, imported.Path())
+				return result, fmt.Errorf("package %s imports %s but couldn't find dependency", pkg.ImportPath, imported.Path())
 			}
 			importedPackages = append(importedPackages, job)
 			actionIDDependencies = append(actionIDDependencies, job)
@@ -302,7 +315,6 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 				actionID := packageAction{
 					ImportPath:       pkg.ImportPath,
 					CompilerBuildID:  string(compilerBuildID),
-					TinyGoVersion:    goenv.Version,
 					LLVMVersion:      llvm.Version,
 					Config:           compilerConfig,
 					CFlags:           pkg.CFlags,
@@ -310,7 +322,6 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 					EmbeddedFiles:    make(map[string]string, len(allFiles)),
 					Imports:          make(map[string]string, len(pkg.Pkg.Imports())),
 					OptLevel:         optLevel,
-					SizeLevel:        sizeLevel,
 					UndefinedGlobals: undefinedGlobals,
 				}
 				for filePath, hash := range pkg.FileHashes {
@@ -332,6 +343,10 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 			},
 		}
 		packageActionIDJobs[pkg.ImportPath] = packageActionIDJob
+
+		// Build the SSA for the given package.
+		ssaPkg := program.Package(pkg.Pkg)
+		ssaPkg.Build()
 
 		// Now create the job to actually build the package. It will exit early
 		// if the package is already compiled.
@@ -370,7 +385,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 				// Packages are compiled independently anyway.
 				for _, cgoHeader := range pkg.CGoHeaders {
 					// Store the header text in a temporary file.
-					f, err := os.CreateTemp(dir, "cgosnippet-*.c")
+					f, err := os.CreateTemp(tmpdir, "cgosnippet-*.c")
 					if err != nil {
 						return err
 					}
@@ -418,7 +433,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 						return errors.New("global not found: " + globalName)
 					}
 					name := global.Name()
-					newGlobal := llvm.AddGlobal(mod, global.Type().ElementType(), name+".tmp")
+					newGlobal := llvm.AddGlobal(mod, global.GlobalValueType(), name+".tmp")
 					global.ReplaceAllUsesWith(newGlobal)
 					global.EraseFromParentAsGlobal()
 					newGlobal.SetName(name)
@@ -517,13 +532,13 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 			irbuilder := mod.Context().NewBuilder()
 			defer irbuilder.Dispose()
 			irbuilder.SetInsertPointAtEnd(block)
-			i8ptrType := llvm.PointerType(mod.Context().Int8Type(), 0)
+			ptrType := llvm.PointerType(mod.Context().Int8Type(), 0)
 			for _, pkg := range lprogram.Sorted() {
 				pkgInit := mod.NamedFunction(pkg.Pkg.Path() + ".init")
 				if pkgInit.IsNil() {
 					panic("init not found for " + pkg.Pkg.Path())
 				}
-				irbuilder.CreateCall(pkgInit, []llvm.Value{llvm.Undef(i8ptrType)}, "")
+				irbuilder.CreateCall(pkgInit.GlobalValueType(), pkgInit, []llvm.Value{llvm.Undef(ptrType)}, "")
 			}
 			irbuilder.CreateRetVoid()
 
@@ -558,7 +573,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 
 			// Run all optimization passes, which are much more effective now
 			// that the optimizer can see the whole program at once.
-			err := optimizeProgram(mod, config)
+			err := optimizeProgram(mod, config, globalValues)
 			if err != nil {
 				return err
 			}
@@ -579,29 +594,24 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 		// Run jobs to produce the LLVM module.
 		err := runJobs(programJob, config.Options.Semaphore)
 		if err != nil {
-			return err
+			return result, err
 		}
 		// Generate output.
 		switch outext {
 		case ".o":
 			llvmBuf, err := machine.EmitToMemoryBuffer(mod, llvm.ObjectFile)
 			if err != nil {
-				return err
+				return result, err
 			}
 			defer llvmBuf.Dispose()
-			return os.WriteFile(outpath, llvmBuf.Bytes(), 0666)
+			return result, os.WriteFile(outpath, llvmBuf.Bytes(), 0666)
 		case ".bc":
-			var buf llvm.MemoryBuffer
-			if config.UseThinLTO() {
-				buf = llvm.WriteThinLTOBitcodeToMemoryBuffer(mod)
-			} else {
-				buf = llvm.WriteBitcodeToMemoryBuffer(mod)
-			}
+			buf := llvm.WriteThinLTOBitcodeToMemoryBuffer(mod)
 			defer buf.Dispose()
-			return os.WriteFile(outpath, buf.Bytes(), 0666)
+			return result, os.WriteFile(outpath, buf.Bytes(), 0666)
 		case ".ll":
 			data := []byte(mod.String())
-			return os.WriteFile(outpath, data, 0666)
+			return result, os.WriteFile(outpath, data, 0666)
 		default:
 			panic("unreachable")
 		}
@@ -612,22 +622,13 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	// run all jobs in parallel as far as possible.
 
 	// Add job to write the output object file.
-	objfile := filepath.Join(dir, "main.o")
+	objfile := filepath.Join(tmpdir, "main.o")
 	outputObjectFileJob := &compileJob{
 		description:  "generate output file",
 		dependencies: []*compileJob{programJob},
 		result:       objfile,
 		run: func(*compileJob) error {
-			var llvmBuf llvm.MemoryBuffer
-			if config.UseThinLTO() {
-				llvmBuf = llvm.WriteThinLTOBitcodeToMemoryBuffer(mod)
-			} else {
-				var err error
-				llvmBuf, err = machine.EmitToMemoryBuffer(mod, llvm.ObjectFile)
-				if err != nil {
-					return err
-				}
-			}
+			llvmBuf := llvm.WriteThinLTOBitcodeToMemoryBuffer(mod)
 			defer llvmBuf.Dispose()
 			return os.WriteFile(objfile, llvmBuf.Bytes(), 0666)
 		},
@@ -635,19 +636,19 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 
 	// Prepare link command.
 	linkerDependencies := []*compileJob{outputObjectFileJob}
-	executable := filepath.Join(dir, "main")
+	result.Executable = filepath.Join(tmpdir, "main")
 	if config.GOOS() == "windows" {
-		executable += ".exe"
+		result.Executable += ".exe"
 	}
-	tmppath := executable // final file
-	ldflags := append(config.LDFlags(), "-o", executable)
+	result.Binary = result.Executable // final file
+	ldflags := append(config.LDFlags(), "-o", result.Executable)
 
 	// Add compiler-rt dependency if needed. Usually this is a simple load from
 	// a cache.
 	if config.Target.RTLib == "compiler-rt" {
-		job, unlock, err := CompilerRT.load(config, dir)
+		job, unlock, err := CompilerRT.load(config, tmpdir)
 		if err != nil {
-			return err
+			return result, err
 		}
 		defer unlock()
 		linkerDependencies = append(linkerDependencies, job)
@@ -661,7 +662,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 		job := &compileJob{
 			description: "compile extra file " + path,
 			run: func(job *compileJob) error {
-				result, err := compileAndCacheCFile(abspath, dir, config.CFlags(), config.UseThinLTO(), config.Options.PrintCommands)
+				result, err := compileAndCacheCFile(abspath, tmpdir, config.CFlags(false), config.Options.PrintCommands)
 				job.result = result
 				return err
 			},
@@ -679,7 +680,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 			job := &compileJob{
 				description: "compile CGo file " + abspath,
 				run: func(job *compileJob) error {
-					result, err := compileAndCacheCFile(abspath, dir, pkg.CFlags, config.UseThinLTO(), config.Options.PrintCommands)
+					result, err := compileAndCacheCFile(abspath, tmpdir, pkg.CFlags, config.Options.PrintCommands)
 					job.result = result
 					return err
 				},
@@ -722,7 +723,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 			ldflags = append(ldflags, "--strip-debug")
 		} else {
 			// Other linkers may have different flags.
-			return errors.New("cannot remove debug information: unknown linker: " + config.Target.Linker)
+			return result, errors.New("cannot remove debug information: unknown linker: " + config.Target.Linker)
 		}
 	}
 
@@ -738,43 +739,41 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 				}
 				ldflags = append(ldflags, dependency.result)
 			}
+			ldflags = append(ldflags, "-mllvm", "-mcpu="+config.CPU())
+			if config.GOOS() == "windows" {
+				// Options for the MinGW wrapper for the lld COFF linker.
+				ldflags = append(ldflags,
+					"-Xlink=/opt:lldlto="+strconv.Itoa(speedLevel),
+					"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"))
+			} else if config.GOOS() == "darwin" {
+				// Options for the ld64-compatible lld linker.
+				ldflags = append(ldflags,
+					"--lto-O"+strconv.Itoa(speedLevel),
+					"-cache_path_lto", filepath.Join(cacheDir, "thinlto"))
+			} else {
+				// Options for the ELF linker.
+				ldflags = append(ldflags,
+					"--lto-O"+strconv.Itoa(speedLevel),
+					"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"),
+				)
+			}
+			if config.CodeModel() != "default" {
+				ldflags = append(ldflags,
+					"-mllvm", "-code-model="+config.CodeModel())
+			}
+			if sizeLevel >= 2 {
+				// Workaround with roughly the same effect as
+				// https://reviews.llvm.org/D119342.
+				// Can hopefully be removed in LLVM 18.
+				ldflags = append(ldflags,
+					"-mllvm", "--rotation-max-header-size=0")
+			}
 			if config.Options.PrintCommands != nil {
 				config.Options.PrintCommands(config.Target.Linker, ldflags...)
 			}
-			if config.UseThinLTO() {
-				ldflags = append(ldflags, "-mllvm", "-mcpu="+config.CPU())
-				if config.GOOS() == "windows" {
-					// Options for the MinGW wrapper for the lld COFF linker.
-					ldflags = append(ldflags,
-						"-Xlink=/opt:lldlto="+strconv.Itoa(optLevel),
-						"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"))
-				} else if config.GOOS() == "darwin" {
-					// Options for the ld64-compatible lld linker.
-					ldflags = append(ldflags,
-						"--lto-O"+strconv.Itoa(optLevel),
-						"-cache_path_lto", filepath.Join(cacheDir, "thinlto"))
-				} else {
-					// Options for the ELF linker.
-					ldflags = append(ldflags,
-						"--lto-O"+strconv.Itoa(optLevel),
-						"--thinlto-cache-dir="+filepath.Join(cacheDir, "thinlto"),
-					)
-				}
-				if config.CodeModel() != "default" {
-					ldflags = append(ldflags,
-						"-mllvm", "-code-model="+config.CodeModel())
-				}
-				if sizeLevel >= 2 {
-					// Workaround with roughly the same effect as
-					// https://reviews.llvm.org/D119342.
-					// Can hopefully be removed in LLVM 15.
-					ldflags = append(ldflags,
-						"-mllvm", "--rotation-max-header-size=0")
-				}
-			}
 			err = link(config.Target.Linker, ldflags...)
 			if err != nil {
-				return &commandError{"failed to link", executable, err}
+				return &commandError{"failed to link", result.Executable, err}
 			}
 
 			var calculatedStacks []string
@@ -783,7 +782,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 				// Try to determine stack sizes at compile time.
 				// Don't do this by default as it usually doesn't work on
 				// unsupported architectures.
-				calculatedStacks, stackSizes, err = determineStackSizes(mod, executable)
+				calculatedStacks, stackSizes, err = determineStackSizes(mod, result.Executable)
 				if err != nil {
 					return err
 				}
@@ -793,41 +792,51 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 			if config.AutomaticStackSize() {
 				// Modify the .tinygo_stacksizes section that contains a stack size
 				// for each goroutine.
-				err = modifyStackSizes(executable, stackSizeLoads, stackSizes)
+				err = modifyStackSizes(result.Executable, stackSizeLoads, stackSizes)
 				if err != nil {
 					return fmt.Errorf("could not modify stack sizes: %w", err)
 				}
 			}
 			if config.RP2040BootPatch() {
 				// Patch the second stage bootloader CRC into the .boot2 section
-				err = patchRP2040BootCRC(executable)
+				err = patchRP2040BootCRC(result.Executable)
 				if err != nil {
 					return fmt.Errorf("could not patch RP2040 second stage boot loader: %w", err)
 				}
 			}
 
-			// Run wasm-opt if necessary.
-			if config.Scheduler() == "asyncify" {
-				var optLevel, shrinkLevel int
+			// Run wasm-opt for wasm binaries
+			if arch := strings.Split(config.Triple(), "-")[0]; arch == "wasm32" {
+				var opt string
 				switch config.Options.Opt {
 				case "none", "0":
+					opt = "-O0"
 				case "1":
-					optLevel = 1
+					opt = "-O1"
 				case "2":
-					optLevel = 2
+					opt = "-O2"
 				case "s":
-					optLevel = 2
-					shrinkLevel = 1
+					opt = "-Os"
 				case "z":
-					optLevel = 2
-					shrinkLevel = 2
+					opt = "-Oz"
 				default:
 					return fmt.Errorf("unknown opt level: %q", config.Options.Opt)
 				}
-				cmd := exec.Command(goenv.Get("WASMOPT"), "--asyncify", "-g",
-					"--optimize-level", strconv.Itoa(optLevel),
-					"--shrink-level", strconv.Itoa(shrinkLevel),
-					executable, "--output", executable)
+
+				var args []string
+
+				if config.Scheduler() == "asyncify" {
+					args = append(args, "--asyncify")
+				}
+
+				args = append(args,
+					opt,
+					"-g",
+					result.Executable,
+					"--output", result.Executable,
+				)
+
+				cmd := exec.Command(goenv.Get("WASMOPT"), args...)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 
@@ -843,7 +852,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 				for _, pkg := range lprogram.Sorted() {
 					packagePathMap[pkg.OriginalDir()] = pkg.Pkg.Path()
 				}
-				sizes, err := loadProgramSize(executable, packagePathMap)
+				sizes, err := loadProgramSize(result.Executable, packagePathMap)
 				if err != nil {
 					return err
 				}
@@ -879,7 +888,7 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	// is simpler and cannot be parallelized.
 	err = runJobs(linkJob, config.Options.Semaphore)
 	if err != nil {
-		return err
+		return result, err
 	}
 
 	// Get an Intel .hex file or .bin file from the .elf file.
@@ -890,56 +899,38 @@ func Build(pkgName, outpath string, config *compileopts.Config, action func(Buil
 	case "hex", "bin":
 		// Extract raw binary, either encoding it as a hex file or as a raw
 		// firmware file.
-		tmppath = filepath.Join(dir, "main"+outext)
-		err := objcopy(executable, tmppath, outputBinaryFormat)
+		result.Binary = filepath.Join(tmpdir, "main"+outext)
+		err := objcopy(result.Executable, result.Binary, outputBinaryFormat)
 		if err != nil {
-			return err
+			return result, err
 		}
 	case "uf2":
 		// Get UF2 from the .elf file.
-		tmppath = filepath.Join(dir, "main"+outext)
-		err := convertELFFileToUF2File(executable, tmppath, config.Target.UF2FamilyID)
+		result.Binary = filepath.Join(tmpdir, "main"+outext)
+		err := convertELFFileToUF2File(result.Executable, result.Binary, config.Target.UF2FamilyID)
 		if err != nil {
-			return err
+			return result, err
 		}
 	case "esp32", "esp32-img", "esp32c3", "esp8266":
 		// Special format for the ESP family of chips (parsed by the ROM
 		// bootloader).
-		tmppath = filepath.Join(dir, "main"+outext)
-		err := makeESPFirmareImage(executable, tmppath, outputBinaryFormat)
+		result.Binary = filepath.Join(tmpdir, "main"+outext)
+		err := makeESPFirmareImage(result.Executable, result.Binary, outputBinaryFormat)
 		if err != nil {
-			return err
+			return result, err
 		}
 	case "nrf-dfu":
 		// special format for nrfutil for Nordic chips
-		tmphexpath := filepath.Join(dir, "main.hex")
-		err := objcopy(executable, tmphexpath, "hex")
+		result.Binary = filepath.Join(tmpdir, "main"+outext)
+		err = makeDFUFirmwareImage(config.Options, result.Executable, result.Binary)
 		if err != nil {
-			return err
-		}
-		tmppath = filepath.Join(dir, "main"+outext)
-		err = makeDFUFirmwareImage(config.Options, tmphexpath, tmppath)
-		if err != nil {
-			return err
+			return result, err
 		}
 	default:
-		return fmt.Errorf("unknown output binary format: %s", outputBinaryFormat)
+		return result, fmt.Errorf("unknown output binary format: %s", outputBinaryFormat)
 	}
 
-	// If there's a module root, use that.
-	moduleroot := lprogram.MainPkg().Module.Dir
-	if moduleroot == "" {
-		// if not, just the regular root
-		moduleroot = lprogram.MainPkg().Root
-	}
-
-	return action(BuildResult{
-		Executable: executable,
-		Binary:     tmppath,
-		MainDir:    lprogram.MainPkg().Dir,
-		ModuleRoot: moduleroot,
-		ImportPath: lprogram.MainPkg().ImportPath,
-	})
+	return result, nil
 }
 
 // createEmbedObjectFile creates a new object file with the given contents, for
@@ -1051,7 +1042,7 @@ func createEmbedObjectFile(data, hexSum, sourceFile, sourceDir, tmpdir string, c
 // optimizeProgram runs a series of optimizations and transformations that are
 // needed to convert a program to its final form. Some transformations are not
 // optional and must be run as the compiler expects them to run.
-func optimizeProgram(mod llvm.Module, config *compileopts.Config) error {
+func optimizeProgram(mod llvm.Module, config *compileopts.Config, globalValues map[string]map[string]string) error {
 	err := interp.Run(mod, config.Options.InterpTimeout, config.DumpSSA())
 	if err != nil {
 		return err
@@ -1069,32 +1060,15 @@ func optimizeProgram(mod llvm.Module, config *compileopts.Config) error {
 		}
 	}
 
-	if config.GOOS() != "darwin" && !config.UseThinLTO() {
-		transform.ApplyFunctionSections(mod) // -ffunction-sections
-	}
-
 	// Insert values from -ldflags="-X ..." into the IR.
-	err = setGlobalValues(mod, config.Options.GlobalValues)
+	err = setGlobalValues(mod, globalValues)
 	if err != nil {
 		return err
 	}
 
-	// Browsers cannot handle external functions that have type i64 because it
-	// cannot be represented exactly in JavaScript (JS only has doubles). To
-	// keep functions interoperable, pass int64 types as pointers to
-	// stack-allocated values.
-	// Use -wasm-abi=generic to disable this behaviour.
-	if config.WasmAbi() == "js" {
-		err := transform.ExternalInt64AsPtr(mod, config)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Optimization levels here are roughly the same as Clang, but probably not
-	// exactly.
-	optLevel, sizeLevel, inlinerThreshold := config.OptLevels()
-	errs := transform.Optimize(mod, config, optLevel, sizeLevel, inlinerThreshold)
+	// Run most of the whole-program optimizations (including the whole
+	// O0/O1/O2/Os/Oz optimization pipeline).
+	errs := transform.Optimize(mod, config)
 	if len(errs) > 0 {
 		return newMultiError(errs)
 	}
@@ -1134,7 +1108,7 @@ func setGlobalValues(mod llvm.Module, globals map[string]map[string]string) erro
 
 			// A strin is a {ptr, len} pair. We need these types to build the
 			// initializer.
-			initializerType := global.Type().ElementType()
+			initializerType := global.GlobalValueType()
 			if initializerType.TypeKind() != llvm.StructTypeKind || initializerType.StructName() == "" {
 				return fmt.Errorf("%s: not a string", globalName)
 			}
@@ -1153,7 +1127,7 @@ func setGlobalValues(mod llvm.Module, globals map[string]map[string]string) erro
 
 			// Create the string value, which is a {ptr, len} pair.
 			zero := llvm.ConstInt(mod.Context().Int32Type(), 0, false)
-			ptr := llvm.ConstGEP(buf, []llvm.Value{zero, zero})
+			ptr := llvm.ConstGEP(bufInitializer.Type(), buf, []llvm.Value{zero, zero})
 			if ptr.Type() != elementTypes[0] {
 				return fmt.Errorf("%s: not a string", globalName)
 			}

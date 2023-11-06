@@ -8,9 +8,9 @@
 // Type checking errors after CGo processing:
 //     testdata/errors.go:102: cannot use 2 << 10 (untyped int constant 2048) as C.char value in variable declaration (overflows)
 //     testdata/errors.go:105: unknown field z in struct literal
-//     testdata/errors.go:108: undeclared name: C.SOME_CONST_1
+//     testdata/errors.go:108: undefined: C.SOME_CONST_1
 //     testdata/errors.go:110: cannot use C.SOME_CONST_3 (untyped int constant 1234) as byte value in variable declaration (overflows)
-//     testdata/errors.go:112: undeclared name: C.SOME_CONST_4
+//     testdata/errors.go:112: undefined: C.SOME_CONST_4
 
 package main
 
@@ -51,10 +51,10 @@ type (
 	C.longlong  int64
 	C.ulonglong uint64
 )
-type C._Ctype_struct___0 struct {
+type C.struct_point_t struct {
 	x C.int
 	y C.int
 }
-type C.point_t = C._Ctype_struct___0
+type C.point_t = C.struct_point_t
 
 const C.SOME_CONST_3 = 1234

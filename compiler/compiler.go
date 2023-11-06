@@ -41,11 +41,13 @@ type Config struct {
 	Triple          string
 	CPU             string
 	Features        string
+	ABI             string
 	GOOS            string
 	GOARCH          string
 	CodeModel       string
 	RelocationModel string
 	SizeLevel       int
+	TinyGoVersion   string // for llvm.ident
 
 	// Various compiler options that determine how code is generated.
 	Scheduler          string
@@ -63,20 +65,23 @@ type compilerContext struct {
 	DumpSSA          bool
 	mod              llvm.Module
 	ctx              llvm.Context
+	builder          llvm.Builder // only used for constant operations
 	dibuilder        *llvm.DIBuilder
 	cu               llvm.Metadata
 	difiles          map[string]llvm.Metadata
 	ditypes          map[types.Type]llvm.Metadata
 	llvmTypes        typeutil.Map
+	interfaceTypes   typeutil.Map
 	machine          llvm.TargetMachine
 	targetData       llvm.TargetData
 	intType          llvm.Type
-	i8ptrType        llvm.Type // for convenience
-	rawVoidFuncType  llvm.Type // for convenience
+	dataPtrType      llvm.Type // pointer in address space 0
+	funcPtrType      llvm.Type // pointer in function address space (1 for AVR, 0 elsewhere)
 	funcPtrAddrSpace int
 	uintptrType      llvm.Type
 	program          *ssa.Program
 	diagnostics      []error
+	functionInfos    map[*ssa.Function]functionInfo
 	astComments      map[string]*ast.CommentGroup
 	embedGlobals     map[string][]*loader.EmbedFile
 	pkg              *types.Package
@@ -88,16 +93,18 @@ type compilerContext struct {
 // importantly with a newly created LLVM context and module.
 func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *Config, dumpSSA bool) *compilerContext {
 	c := &compilerContext{
-		Config:      config,
-		DumpSSA:     dumpSSA,
-		difiles:     make(map[string]llvm.Metadata),
-		ditypes:     make(map[types.Type]llvm.Metadata),
-		machine:     machine,
-		targetData:  machine.CreateTargetData(),
-		astComments: map[string]*ast.CommentGroup{},
+		Config:        config,
+		DumpSSA:       dumpSSA,
+		difiles:       make(map[string]llvm.Metadata),
+		ditypes:       make(map[types.Type]llvm.Metadata),
+		machine:       machine,
+		targetData:    machine.CreateTargetData(),
+		functionInfos: map[*ssa.Function]functionInfo{},
+		astComments:   map[string]*ast.CommentGroup{},
 	}
 
 	c.ctx = llvm.NewContext()
+	c.builder = c.ctx.NewBuilder()
 	c.mod = c.ctx.NewModule(moduleName)
 	c.mod.SetTarget(config.Triple)
 	c.mod.SetDataLayout(c.targetData.String())
@@ -115,15 +122,21 @@ func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *C
 	} else {
 		panic("unknown pointer size")
 	}
-	c.i8ptrType = llvm.PointerType(c.ctx.Int8Type(), 0)
+	c.dataPtrType = llvm.PointerType(c.ctx.Int8Type(), 0)
 
 	dummyFuncType := llvm.FunctionType(c.ctx.VoidType(), nil, false)
 	dummyFunc := llvm.AddFunction(c.mod, "tinygo.dummy", dummyFuncType)
 	c.funcPtrAddrSpace = dummyFunc.Type().PointerAddressSpace()
-	c.rawVoidFuncType = dummyFunc.Type()
+	c.funcPtrType = dummyFunc.Type()
 	dummyFunc.EraseFromParentAsFunction()
 
 	return c
+}
+
+// Dispose everything related to the context, _except_ for the IR module (and
+// the associated context).
+func (c *compilerContext) dispose() {
+	c.builder.Dispose()
 }
 
 // builder contains all information relevant to build a single function.
@@ -131,6 +144,7 @@ type builder struct {
 	*compilerContext
 	llvm.Builder
 	fn                *ssa.Function
+	llvmFnType        llvm.Type
 	llvmFn            llvm.Value
 	info              functionInfo
 	locals            map[ssa.Value]llvm.Value            // local variables
@@ -140,6 +154,7 @@ type builder struct {
 	phis              []phiNode
 	deferPtr          llvm.Value
 	deferFrame        llvm.Value
+	stackChainAlloca  llvm.Value
 	landingpad        llvm.BasicBlock
 	difunc            llvm.Metadata
 	dilocals          map[*types.Var]llvm.Metadata
@@ -152,14 +167,18 @@ type builder struct {
 	deferExprFuncs    map[ssa.Value]int
 	selectRecvBuf     map[*ssa.Select]llvm.Value
 	deferBuiltinFuncs map[ssa.Value]deferBuiltin
+	runDefersBlock    []llvm.BasicBlock
+	afterDefersBlock  []llvm.BasicBlock
 }
 
 func newBuilder(c *compilerContext, irbuilder llvm.Builder, f *ssa.Function) *builder {
+	fnType, fn := c.getFunction(f)
 	return &builder{
 		compilerContext: c,
 		Builder:         irbuilder,
 		fn:              f,
-		llvmFn:          c.getFunction(f),
+		llvmFnType:      fnType,
+		llvmFn:          fn,
 		info:            c.getFunctionInfo(f),
 		locals:          make(map[ssa.Value]llvm.Value),
 		dilocals:        make(map[*types.Var]llvm.Metadata),
@@ -253,6 +272,7 @@ func Sizes(machine llvm.TargetMachine) types.Sizes {
 // CompilePackage compiles a single package to a LLVM module.
 func CompilePackage(moduleName string, pkg *loader.Package, ssaPkg *ssa.Package, machine llvm.TargetMachine, config *Config, dumpSSA bool) (llvm.Module, []error) {
 	c := newCompilerContext(moduleName, machine, config, dumpSSA)
+	defer c.dispose()
 	c.packageDir = pkg.OriginalDir()
 	c.embedGlobals = pkg.EmbedGlobals
 	c.pkg = pkg.Pkg
@@ -305,19 +325,42 @@ func CompilePackage(moduleName string, pkg *loader.Package, ssaPkg *ssa.Package,
 				llvm.ConstInt(c.ctx.Int32Type(), 4, false).ConstantAsMetadata(),
 			}),
 		)
+		if c.TinyGoVersion != "" {
+			// It is necessary to set llvm.ident, otherwise debugging on MacOS
+			// won't work.
+			c.mod.AddNamedMetadataOperand("llvm.ident",
+				c.ctx.MDNode(([]llvm.Metadata{
+					c.ctx.MDString("TinyGo version " + c.TinyGoVersion),
+				})))
+		}
 		c.dibuilder.Finalize()
 		c.dibuilder.Destroy()
 	}
 
+	// Add the "target-abi" flag, which is necessary on RISC-V otherwise it will
+	// pick one that doesn't match the -mabi Clang flag.
+	if c.ABI != "" {
+		c.mod.AddNamedMetadataOperand("llvm.module.flags",
+			c.ctx.MDNode([]llvm.Metadata{
+				llvm.ConstInt(c.ctx.Int32Type(), 1, false).ConstantAsMetadata(), // Error on mismatch
+				c.ctx.MDString("target-abi"),
+				c.ctx.MDString(c.ABI),
+			}),
+		)
+	}
+
 	return c.mod, c.diagnostics
+}
+
+func (c *compilerContext) getRuntimeType(name string) types.Type {
+	return c.runtimePkg.Scope().Lookup(name).(*types.TypeName).Type()
 }
 
 // getLLVMRuntimeType obtains a named type from the runtime package and returns
 // it as a LLVM type, creating it if necessary. It is a shorthand for
 // getLLVMType(getRuntimeType(name)).
 func (c *compilerContext) getLLVMRuntimeType(name string) llvm.Type {
-	typ := c.runtimePkg.Scope().Lookup(name).(*types.TypeName).Type()
-	return c.getLLVMType(typ)
+	return c.getLLVMType(c.getRuntimeType(name))
 }
 
 // getLLVMType returns a LLVM type for a Go type. It doesn't recreate already
@@ -372,16 +415,14 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 		case types.Uintptr:
 			return c.uintptrType
 		case types.UnsafePointer:
-			return c.i8ptrType
+			return c.dataPtrType
 		default:
 			panic("unknown basic type: " + typ.String())
 		}
-	case *types.Chan:
-		return llvm.PointerType(c.getLLVMRuntimeType("channel"), 0)
+	case *types.Chan, *types.Map, *types.Pointer:
+		return c.dataPtrType // all pointers are the same
 	case *types.Interface:
 		return c.getLLVMRuntimeType("_interface")
-	case *types.Map:
-		return llvm.PointerType(c.getLLVMRuntimeType("hashmap"), 0)
 	case *types.Named:
 		if st, ok := typ.Underlying().(*types.Struct); ok {
 			// Structs are a special case. While other named types are ignored
@@ -396,15 +437,11 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 			return llvmType
 		}
 		return c.getLLVMType(typ.Underlying())
-	case *types.Pointer:
-		ptrTo := c.getLLVMType(typ.Elem())
-		return llvm.PointerType(ptrTo, 0)
 	case *types.Signature: // function value
 		return c.getFuncType(typ)
 	case *types.Slice:
-		elemType := c.getLLVMType(typ.Elem())
 		members := []llvm.Type{
-			llvm.PointerType(elemType, 0),
+			c.dataPtrType,
 			c.uintptrType, // len
 			c.uintptrType, // cap
 		}
@@ -494,8 +531,8 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 				Elements: []llvm.Metadata{
 					c.dibuilder.CreateMemberType(llvm.Metadata{}, llvm.DIMemberType{
 						Name:         "ptr",
-						SizeInBits:   c.targetData.TypeAllocSize(c.i8ptrType) * 8,
-						AlignInBits:  uint32(c.targetData.ABITypeAlignment(c.i8ptrType)) * 8,
+						SizeInBits:   c.targetData.TypeAllocSize(c.dataPtrType) * 8,
+						AlignInBits:  uint32(c.targetData.ABITypeAlignment(c.dataPtrType)) * 8,
 						OffsetInBits: 0,
 						Type:         c.getDIType(types.NewPointer(types.Typ[types.Byte])),
 					}),
@@ -523,10 +560,19 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 	case *types.Map:
 		return c.getDIType(types.NewPointer(c.program.ImportedPackage("runtime").Members["hashmap"].(*ssa.Type).Type()))
 	case *types.Named:
-		return c.dibuilder.CreateTypedef(llvm.DITypedef{
+		// Placeholder metadata node, to be replaced afterwards.
+		temporaryMDNode := c.dibuilder.CreateReplaceableCompositeType(llvm.Metadata{}, llvm.DIReplaceableCompositeType{
+			Tag:         dwarf.TagTypedef,
+			SizeInBits:  sizeInBytes * 8,
+			AlignInBits: uint32(c.targetData.ABITypeAlignment(llvmType)) * 8,
+		})
+		c.ditypes[typ] = temporaryMDNode
+		md := c.dibuilder.CreateTypedef(llvm.DITypedef{
 			Type: c.getDIType(typ.Underlying()),
 			Name: typ.String(),
 		})
+		temporaryMDNode.ReplaceAllUsesWith(md)
+		return md
 	case *types.Pointer:
 		return c.dibuilder.CreatePointerType(llvm.DIPointerType{
 			Pointee:      c.getDIType(typ.Elem()),
@@ -588,13 +634,6 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 			},
 		})
 	case *types.Struct:
-		// Placeholder metadata node, to be replaced afterwards.
-		temporaryMDNode := c.dibuilder.CreateReplaceableCompositeType(llvm.Metadata{}, llvm.DIReplaceableCompositeType{
-			Tag:         dwarf.TagStructType,
-			SizeInBits:  sizeInBytes * 8,
-			AlignInBits: uint32(c.targetData.ABITypeAlignment(llvmType)) * 8,
-		})
-		c.ditypes[typ] = temporaryMDNode
 		elements := make([]llvm.Metadata, typ.NumFields())
 		for i := range elements {
 			field := typ.Field(i)
@@ -613,7 +652,6 @@ func (c *compilerContext) createDIType(typ types.Type) llvm.Metadata {
 			AlignInBits: uint32(c.targetData.ABITypeAlignment(llvmType)) * 8,
 			Elements:    elements,
 		})
-		temporaryMDNode.ReplaceAllUsesWith(md)
 		return md
 	case *types.TypeParam:
 		return c.getDIType(typ.Underlying())
@@ -711,7 +749,8 @@ func (b *builder) getLocalVariable(variable *types.Var) llvm.Metadata {
 // DISubprogram metadata node.
 func (c *compilerContext) attachDebugInfo(f *ssa.Function) llvm.Metadata {
 	pos := c.program.Fset.Position(f.Syntax().Pos())
-	return c.attachDebugInfoRaw(f, c.getFunction(f), "", pos.Filename, pos.Line)
+	_, fn := c.getFunction(f)
+	return c.attachDebugInfoRaw(f, fn, "", pos.Filename, pos.Line)
 }
 
 // attachDebugInfo adds debug info to a function declaration. It returns the
@@ -784,7 +823,7 @@ func (c *compilerContext) createPackage(irbuilder llvm.Builder, pkg *ssa.Package
 		member := pkg.Members[name]
 		switch member := member.(type) {
 		case *ssa.Function:
-			if member.Synthetic == "generic function" {
+			if member.TypeParams() != nil {
 				// Do not try to build generic (non-instantiated) functions.
 				continue
 			}
@@ -794,6 +833,11 @@ func (c *compilerContext) createPackage(irbuilder llvm.Builder, pkg *ssa.Package
 				// The body of this function (if there is one) is ignored and
 				// replaced with a LLVM intrinsic call.
 				b.defineMathOp()
+				continue
+			}
+			if ok := b.defineMathBitsIntrinsic(); ok {
+				// Like a math intrinsic, the body of this function was replaced
+				// with a LLVM intrinsic.
 				continue
 			}
 			if member.Blocks == nil {
@@ -822,13 +866,13 @@ func (c *compilerContext) createPackage(irbuilder llvm.Builder, pkg *ssa.Package
 				if fn == nil {
 					continue // probably a generic method
 				}
-				if fn.Blocks == nil {
-					continue // external function
-				}
 				if member.Type().String() != member.String() {
 					// This is a member on a type alias. Do not build such a
 					// function.
 					continue
+				}
+				if fn.Blocks == nil {
+					continue // external function
 				}
 				if fn.Synthetic != "" && fn.Synthetic != "package initializer" {
 					// This function is a kind of wrapper function (created by
@@ -849,7 +893,7 @@ func (c *compilerContext) createPackage(irbuilder llvm.Builder, pkg *ssa.Package
 			if files, ok := c.embedGlobals[member.Name()]; ok {
 				c.createEmbedGlobal(member, global, files)
 			} else if !info.extern {
-				global.SetInitializer(llvm.ConstNull(global.Type().ElementType()))
+				global.SetInitializer(llvm.ConstNull(global.GlobalValueType()))
 				global.SetVisibility(llvm.HiddenVisibility)
 				if info.section != "" {
 					global.SetSection(info.section)
@@ -914,7 +958,7 @@ func (c *compilerContext) createEmbedGlobal(member *ssa.Global, global llvm.Valu
 		bufferGlobal.SetInitializer(bufferValue)
 		bufferGlobal.SetLinkage(llvm.InternalLinkage)
 		bufferGlobal.SetAlignment(1)
-		slicePtr := llvm.ConstInBoundsGEP(bufferGlobal, []llvm.Value{
+		slicePtr := llvm.ConstInBoundsGEP(bufferValue.Type(), bufferGlobal, []llvm.Value{
 			llvm.ConstInt(c.uintptrType, 0, false),
 			llvm.ConstInt(c.uintptrType, 0, false),
 		})
@@ -922,6 +966,19 @@ func (c *compilerContext) createEmbedGlobal(member *ssa.Global, global llvm.Valu
 		sliceObj := c.ctx.ConstStruct([]llvm.Value{slicePtr, sliceLen, sliceLen}, false)
 		global.SetInitializer(sliceObj)
 		global.SetVisibility(llvm.HiddenVisibility)
+
+		if c.Debug {
+			// Add debug info to the slice backing array.
+			position := c.program.Fset.Position(member.Pos())
+			diglobal := c.dibuilder.CreateGlobalVariableExpression(llvm.Metadata{}, llvm.DIGlobalVariableExpression{
+				File:        c.getDIFile(position.Filename),
+				Line:        position.Line,
+				Type:        c.getDIType(types.NewArray(types.Typ[types.Byte], int64(len(file.Data)))),
+				LocalToUnit: true,
+				Expr:        c.dibuilder.CreateExpression(nil),
+			})
+			bufferGlobal.AddMetadata(0, diglobal)
+		}
 
 	case *types.Struct:
 		// Assume this is an embed.FS struct:
@@ -963,30 +1020,43 @@ func (c *compilerContext) createEmbedGlobal(member *ssa.Global, global llvm.Valu
 		})
 
 		// Make the backing array for the []files slice. This is a LLVM global.
-		embedFileStructType := c.getLLVMType(typ.Field(0).Type().(*types.Pointer).Elem().(*types.Slice).Elem())
+		embedFileStructType := typ.Field(0).Type().(*types.Pointer).Elem().(*types.Slice).Elem()
+		llvmEmbedFileStructType := c.getLLVMType(embedFileStructType)
 		var fileStructs []llvm.Value
 		for _, file := range allFiles {
-			fileStruct := llvm.ConstNull(embedFileStructType)
-			name := c.createConst(ssa.NewConst(constant.MakeString(file.Name), types.Typ[types.String]))
-			fileStruct = llvm.ConstInsertValue(fileStruct, name, []uint32{0}) // "name" field
+			fileStruct := llvm.ConstNull(llvmEmbedFileStructType)
+			name := c.createConst(ssa.NewConst(constant.MakeString(file.Name), types.Typ[types.String]), getPos(member))
+			fileStruct = c.builder.CreateInsertValue(fileStruct, name, 0, "") // "name" field
 			if file.Hash != "" {
 				data := c.getEmbedFileString(file)
-				fileStruct = llvm.ConstInsertValue(fileStruct, data, []uint32{1}) // "data" field
+				fileStruct = c.builder.CreateInsertValue(fileStruct, data, 1, "") // "data" field
 			}
 			fileStructs = append(fileStructs, fileStruct)
 		}
-		sliceDataInitializer := llvm.ConstArray(embedFileStructType, fileStructs)
+		sliceDataInitializer := llvm.ConstArray(llvmEmbedFileStructType, fileStructs)
 		sliceDataGlobal := llvm.AddGlobal(c.mod, sliceDataInitializer.Type(), c.pkg.Path()+"$embedfsfiles")
 		sliceDataGlobal.SetInitializer(sliceDataInitializer)
 		sliceDataGlobal.SetLinkage(llvm.InternalLinkage)
 		sliceDataGlobal.SetGlobalConstant(true)
 		sliceDataGlobal.SetUnnamedAddr(true)
 		sliceDataGlobal.SetAlignment(c.targetData.ABITypeAlignment(sliceDataInitializer.Type()))
+		if c.Debug {
+			// Add debug information for code size attribution (among others).
+			position := c.program.Fset.Position(member.Pos())
+			diglobal := c.dibuilder.CreateGlobalVariableExpression(llvm.Metadata{}, llvm.DIGlobalVariableExpression{
+				File:        c.getDIFile(position.Filename),
+				Line:        position.Line,
+				Type:        c.getDIType(types.NewArray(embedFileStructType, int64(len(allFiles)))),
+				LocalToUnit: true,
+				Expr:        c.dibuilder.CreateExpression(nil),
+			})
+			sliceDataGlobal.AddMetadata(0, diglobal)
+		}
 
 		// Create the slice object itself.
 		// Because embed.FS refers to it as *[]embed.file instead of a plain
 		// []embed.file, we have to store this as a global.
-		slicePtr := llvm.ConstInBoundsGEP(sliceDataGlobal, []llvm.Value{
+		slicePtr := llvm.ConstInBoundsGEP(sliceDataInitializer.Type(), sliceDataGlobal, []llvm.Value{
 			llvm.ConstInt(c.uintptrType, 0, false),
 			llvm.ConstInt(c.uintptrType, 0, false),
 		})
@@ -998,11 +1068,22 @@ func (c *compilerContext) createEmbedGlobal(member *ssa.Global, global llvm.Valu
 		sliceGlobal.SetGlobalConstant(true)
 		sliceGlobal.SetUnnamedAddr(true)
 		sliceGlobal.SetAlignment(c.targetData.ABITypeAlignment(sliceInitializer.Type()))
+		if c.Debug {
+			position := c.program.Fset.Position(member.Pos())
+			diglobal := c.dibuilder.CreateGlobalVariableExpression(llvm.Metadata{}, llvm.DIGlobalVariableExpression{
+				File:        c.getDIFile(position.Filename),
+				Line:        position.Line,
+				Type:        c.getDIType(types.NewSlice(embedFileStructType)),
+				LocalToUnit: true,
+				Expr:        c.dibuilder.CreateExpression(nil),
+			})
+			sliceGlobal.AddMetadata(0, diglobal)
+		}
 
 		// Define the embed.FS struct. It has only one field: the files (as a
 		// *[]embed.file).
 		globalInitializer := llvm.ConstNull(c.getLLVMType(member.Type().(*types.Pointer).Elem()))
-		globalInitializer = llvm.ConstInsertValue(globalInitializer, sliceGlobal, []uint32{0})
+		globalInitializer = c.builder.CreateInsertValue(globalInitializer, sliceGlobal, 0, "")
 		global.SetInitializer(globalInitializer)
 		global.SetVisibility(llvm.HiddenVisibility)
 		global.SetAlignment(c.targetData.ABITypeAlignment(globalInitializer.Type()))
@@ -1014,11 +1095,11 @@ func (c *compilerContext) createEmbedGlobal(member *ssa.Global, global llvm.Valu
 func (c *compilerContext) getEmbedFileString(file *loader.EmbedFile) llvm.Value {
 	dataGlobalName := "embed/file_" + file.Hash
 	dataGlobal := c.mod.NamedGlobal(dataGlobalName)
+	dataGlobalType := llvm.ArrayType(c.ctx.Int8Type(), int(file.Size))
 	if dataGlobal.IsNil() {
-		dataGlobalType := llvm.ArrayType(c.ctx.Int8Type(), int(file.Size))
 		dataGlobal = llvm.AddGlobal(c.mod, dataGlobalType, dataGlobalName)
 	}
-	strPtr := llvm.ConstInBoundsGEP(dataGlobal, []llvm.Value{
+	strPtr := llvm.ConstInBoundsGEP(dataGlobalType, dataGlobal, []llvm.Value{
 		llvm.ConstInt(c.uintptrType, 0, false),
 		llvm.ConstInt(c.uintptrType, 0, false),
 	})
@@ -1064,6 +1145,11 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 		// otherwise the function is not exported.
 		functionAttr := b.ctx.CreateStringAttribute("wasm-export-name", b.info.linkName)
 		b.llvmFn.AddFunctionAttr(functionAttr)
+		// Unlike most targets, exported functions are actually visible in
+		// WebAssembly (even if it's not called from within the WebAssembly
+		// module). But LTO generally optimizes such functions away. Therefore,
+		// exported functions must be explicitly marked as used.
+		llvmutil.AppendToGlobal(b.mod, "llvm.used", b.llvmFn)
 	}
 
 	// Some functions have a pragma controlling the inlining level.
@@ -1192,6 +1278,13 @@ func (b *builder) createFunctionStart(intrinsic bool) {
 		// them.
 		b.deferInitFunc()
 	}
+
+	if b.NeedsStackObjects {
+		// Create a dummy alloca that will be used in runtime.trackPointer.
+		// It is necessary to pass a dummy alloca to runtime.trackPointer
+		// because runtime.trackPointer is replaced by an alloca store.
+		b.stackChainAlloca = b.CreateAlloca(b.ctx.Int8Type(), "stackalloc")
+	}
 }
 
 // createFunction builds the LLVM IR implementation for this function. The
@@ -1225,7 +1318,7 @@ func (b *builder) createFunction() {
 				}
 				dbgVar := b.getLocalVariable(variable)
 				pos := b.program.Fset.Position(instr.Pos())
-				b.dibuilder.InsertValueAtEnd(b.getValue(instr.X), dbgVar, b.dibuilder.CreateExpression(nil), llvm.DebugLoc{
+				b.dibuilder.InsertValueAtEnd(b.getValue(instr.X, getPos(instr)), dbgVar, b.dibuilder.CreateExpression(nil), llvm.DebugLoc{
 					Line:  uint(pos.Line),
 					Col:   uint(pos.Column),
 					Scope: b.difunc,
@@ -1246,6 +1339,15 @@ func (b *builder) createFunction() {
 		}
 	}
 
+	// The rundefers instruction needs to be created after all defer
+	// instructions have been created. Otherwise it won't handle all defer
+	// cases.
+	for i, bb := range b.runDefersBlock {
+		b.SetInsertPointAtEnd(bb)
+		b.createRunDefers()
+		b.CreateBr(b.afterDefersBlock[i])
+	}
+
 	if b.hasDeferFrame() {
 		// Create the landing pad block, where execution continues after a
 		// panic.
@@ -1256,7 +1358,7 @@ func (b *builder) createFunction() {
 	for _, phi := range b.phis {
 		block := phi.ssa.Block()
 		for i, edge := range phi.ssa.Edges {
-			llvmVal := b.getValue(edge)
+			llvmVal := b.getValue(edge, getPos(phi.ssa))
 			llvmBlock := b.blockExits[block.Preds[i]]
 			phi.llvm.AddIncoming([]llvm.Value{llvmVal}, []llvm.BasicBlock{llvmBlock})
 		}
@@ -1364,7 +1466,7 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		// Start a new goroutine.
 		b.createGo(instr)
 	case *ssa.If:
-		cond := b.getValue(instr.Cond)
+		cond := b.getValue(instr.Cond, getPos(instr))
 		block := instr.Block()
 		blockThen := b.blockEntries[block.Succs[0]]
 		blockElse := b.blockEntries[block.Succs[1]]
@@ -1373,13 +1475,13 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		blockJump := b.blockEntries[instr.Block().Succs[0]]
 		b.CreateBr(blockJump)
 	case *ssa.MapUpdate:
-		m := b.getValue(instr.Map)
-		key := b.getValue(instr.Key)
-		value := b.getValue(instr.Value)
+		m := b.getValue(instr.Map, getPos(instr))
+		key := b.getValue(instr.Key, getPos(instr))
+		value := b.getValue(instr.Value, getPos(instr))
 		mapType := instr.Map.Type().Underlying().(*types.Map)
 		b.createMapUpdate(mapType.Key(), m, key, value, instr.Pos())
 	case *ssa.Panic:
-		value := b.getValue(instr.X)
+		value := b.getValue(instr.X, getPos(instr))
 		b.createRuntimeInvoke("_panic", []llvm.Value{value}, "")
 		b.CreateUnreachable()
 	case *ssa.Return:
@@ -1389,23 +1491,30 @@ func (b *builder) createInstruction(instr ssa.Instruction) {
 		if len(instr.Results) == 0 {
 			b.CreateRetVoid()
 		} else if len(instr.Results) == 1 {
-			b.CreateRet(b.getValue(instr.Results[0]))
+			b.CreateRet(b.getValue(instr.Results[0], getPos(instr)))
 		} else {
 			// Multiple return values. Put them all in a struct.
-			retVal := llvm.ConstNull(b.llvmFn.Type().ElementType().ReturnType())
+			retVal := llvm.ConstNull(b.llvmFn.GlobalValueType().ReturnType())
 			for i, result := range instr.Results {
-				val := b.getValue(result)
+				val := b.getValue(result, getPos(instr))
 				retVal = b.CreateInsertValue(retVal, val, i, "")
 			}
 			b.CreateRet(retVal)
 		}
 	case *ssa.RunDefers:
-		b.createRunDefers()
+		// Note where we're going to put the rundefers block
+		run := b.insertBasicBlock("rundefers.block")
+		b.CreateBr(run)
+		b.runDefersBlock = append(b.runDefersBlock, run)
+
+		after := b.insertBasicBlock("rundefers.after")
+		b.SetInsertPointAtEnd(after)
+		b.afterDefersBlock = append(b.afterDefersBlock, after)
 	case *ssa.Send:
 		b.createChanSend(instr)
 	case *ssa.Store:
-		llvmAddr := b.getValue(instr.Addr)
-		llvmVal := b.getValue(instr.Val)
+		llvmAddr := b.getValue(instr.Addr, getPos(instr))
+		llvmVal := b.getValue(instr.Val, getPos(instr))
 		b.createNilCheck(instr.Addr, llvmAddr, "store")
 		if b.targetData.TypeAllocSize(llvmVal.Type()) == 0 {
 			// nothing to store
@@ -1425,21 +1534,18 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		src := argValues[0]
 		elems := argValues[1]
 		srcBuf := b.CreateExtractValue(src, 0, "append.srcBuf")
-		srcPtr := b.CreateBitCast(srcBuf, b.i8ptrType, "append.srcPtr")
 		srcLen := b.CreateExtractValue(src, 1, "append.srcLen")
 		srcCap := b.CreateExtractValue(src, 2, "append.srcCap")
 		elemsBuf := b.CreateExtractValue(elems, 0, "append.elemsBuf")
-		elemsPtr := b.CreateBitCast(elemsBuf, b.i8ptrType, "append.srcPtr")
 		elemsLen := b.CreateExtractValue(elems, 1, "append.elemsLen")
-		elemType := srcBuf.Type().ElementType()
+		elemType := b.getLLVMType(argTypes[0].Underlying().(*types.Slice).Elem())
 		elemSize := llvm.ConstInt(b.uintptrType, b.targetData.TypeAllocSize(elemType), false)
-		result := b.createRuntimeCall("sliceAppend", []llvm.Value{srcPtr, elemsPtr, srcLen, srcCap, elemsLen, elemSize}, "append.new")
+		result := b.createRuntimeCall("sliceAppend", []llvm.Value{srcBuf, elemsBuf, srcLen, srcCap, elemsLen, elemSize}, "append.new")
 		newPtr := b.CreateExtractValue(result, 0, "append.newPtr")
-		newBuf := b.CreateBitCast(newPtr, srcBuf.Type(), "append.newBuf")
 		newLen := b.CreateExtractValue(result, 1, "append.newLen")
 		newCap := b.CreateExtractValue(result, 2, "append.newCap")
 		newSlice := llvm.Undef(src.Type())
-		newSlice = b.CreateInsertValue(newSlice, newBuf, 0, "")
+		newSlice = b.CreateInsertValue(newSlice, newPtr, 0, "")
 		newSlice = b.CreateInsertValue(newSlice, newLen, 1, "")
 		newSlice = b.CreateInsertValue(newSlice, newCap, 2, "")
 		return newSlice, nil
@@ -1477,6 +1583,42 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		cplx = b.CreateInsertValue(cplx, r, 0, "")
 		cplx = b.CreateInsertValue(cplx, i, 1, "")
 		return cplx, nil
+	case "clear":
+		value := argValues[0]
+		switch typ := argTypes[0].Underlying().(type) {
+		case *types.Slice:
+			elementType := b.getLLVMType(typ.Elem())
+			elementSize := b.targetData.TypeAllocSize(elementType)
+			elementAlign := b.targetData.ABITypeAlignment(elementType)
+
+			// The pointer to the data to be cleared.
+			llvmBuf := b.CreateExtractValue(value, 0, "buf")
+
+			// The length (in bytes) to be cleared.
+			llvmLen := b.CreateExtractValue(value, 1, "len")
+			llvmLen = b.CreateMul(llvmLen, llvm.ConstInt(llvmLen.Type(), elementSize, false), "")
+
+			// Do the clear operation using the LLVM memset builtin.
+			// This is also correct for nil slices: in those cases, len will be
+			// 0 which means the memset call is a no-op (according to the LLVM
+			// LangRef).
+			memset := b.getMemsetFunc()
+			call := b.createCall(memset.GlobalValueType(), memset, []llvm.Value{
+				llvmBuf, // dest
+				llvm.ConstInt(b.ctx.Int8Type(), 0, false), // val
+				llvmLen, // len
+				llvm.ConstInt(b.ctx.Int1Type(), 0, false), // isVolatile
+			}, "")
+			call.AddCallSiteAttribute(1, b.ctx.CreateEnumAttribute(llvm.AttributeKindID("align"), uint64(elementAlign)))
+
+			return llvm.Value{}, nil
+		case *types.Map:
+			m := argValues[0]
+			b.createMapClear(m)
+			return llvm.Value{}, nil
+		default:
+			return llvm.Value{}, b.makeError(pos, "unsupported type in clear builtin: "+typ.String())
+		}
 	case "copy":
 		dst := argValues[0]
 		src := argValues[1]
@@ -1484,9 +1626,7 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		srcLen := b.CreateExtractValue(src, 1, "copy.srcLen")
 		dstBuf := b.CreateExtractValue(dst, 0, "copy.dstArray")
 		srcBuf := b.CreateExtractValue(src, 0, "copy.srcArray")
-		elemType := dstBuf.Type().ElementType()
-		dstBuf = b.CreateBitCast(dstBuf, b.i8ptrType, "copy.dstPtr")
-		srcBuf = b.CreateBitCast(srcBuf, b.i8ptrType, "copy.srcPtr")
+		elemType := b.getLLVMType(argTypes[0].Underlying().(*types.Slice).Elem())
 		elemSize := llvm.ConstInt(b.uintptrType, b.targetData.TypeAllocSize(elemType), false)
 		return b.createRuntimeCall("sliceCopy", []llvm.Value{dstBuf, srcBuf, dstLen, srcLen, elemSize}, "copy.n"), nil
 	case "delete":
@@ -1514,6 +1654,24 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 			llvmLen = b.CreateZExt(llvmLen, b.intType, "len.int")
 		}
 		return llvmLen, nil
+	case "min", "max":
+		// min and max builtins, added in Go 1.21.
+		// We can simply reuse the existing binop comparison code, which has all
+		// the edge cases figured out already.
+		tok := token.LSS
+		if callName == "max" {
+			tok = token.GTR
+		}
+		result := argValues[0]
+		typ := argTypes[0]
+		for _, arg := range argValues[1:] {
+			cmp, err := b.createBinOp(tok, typ, typ, result, arg, pos)
+			if err != nil {
+				return result, err
+			}
+			result = b.CreateSelect(cmp, result, arg, "")
+		}
+		return result, nil
 	case "print", "println":
 		for i, value := range argValues {
 			if i >= 1 && callName == "println" {
@@ -1597,7 +1755,7 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 		// Note: the pointer is always of type *i8.
 		ptr := argValues[0]
 		len := argValues[1]
-		return b.CreateGEP(ptr, []llvm.Value{len}, ""), nil
+		return b.CreateGEP(b.ctx.Int8Type(), ptr, []llvm.Value{len}, ""), nil
 	case "Alignof": // unsafe.Alignof
 		align := b.targetData.ABITypeAlignment(argValues[0].Type())
 		return llvm.ConstInt(b.uintptrType, uint64(align), false), nil
@@ -1612,19 +1770,20 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 	case "Sizeof": // unsafe.Sizeof
 		size := b.targetData.TypeAllocSize(argValues[0].Type())
 		return llvm.ConstInt(b.uintptrType, size, false), nil
-	case "Slice": // unsafe.Slice
-		// This creates a slice from a pointer and a length.
+	case "Slice", "String": // unsafe.Slice, unsafe.String
+		// This creates a slice or string from a pointer and a length.
 		// Note that the exception mentioned in the documentation (if the
 		// pointer and length are nil, the slice is also nil) is trivially
 		// already the case.
 		ptr := argValues[0]
 		len := argValues[1]
-		slice := llvm.Undef(b.ctx.StructType([]llvm.Type{
-			ptr.Type(),
-			b.uintptrType,
-			b.uintptrType,
-		}, false))
-		b.createUnsafeSliceCheck(ptr, len, argTypes[1].Underlying().(*types.Basic))
+		var elementType llvm.Type
+		if callName == "Slice" {
+			elementType = b.getLLVMType(argTypes[0].Underlying().(*types.Pointer).Elem())
+		} else {
+			elementType = b.ctx.Int8Type()
+		}
+		b.createUnsafeSliceStringCheck("unsafe."+callName, ptr, len, elementType, argTypes[1].Underlying().(*types.Basic))
 		if len.Type().IntTypeWidth() < b.uintptrType.IntTypeWidth() {
 			// Too small, zero-extend len.
 			len = b.CreateZExt(len, b.uintptrType, "")
@@ -1632,10 +1791,24 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 			// Too big, truncate len.
 			len = b.CreateTrunc(len, b.uintptrType, "")
 		}
-		slice = b.CreateInsertValue(slice, ptr, 0, "")
-		slice = b.CreateInsertValue(slice, len, 1, "")
-		slice = b.CreateInsertValue(slice, len, 2, "")
-		return slice, nil
+		if callName == "Slice" {
+			slice := llvm.Undef(b.ctx.StructType([]llvm.Type{
+				ptr.Type(),
+				b.uintptrType,
+				b.uintptrType,
+			}, false))
+			slice = b.CreateInsertValue(slice, ptr, 0, "")
+			slice = b.CreateInsertValue(slice, len, 1, "")
+			slice = b.CreateInsertValue(slice, len, 2, "")
+			return slice, nil
+		} else {
+			str := llvm.Undef(b.getLLVMRuntimeType("_string"))
+			str = b.CreateInsertValue(str, argValues[0], 0, "")
+			str = b.CreateInsertValue(str, len, 1, "")
+			return str, nil
+		}
+	case "SliceData", "StringData": // unsafe.SliceData, unsafe.StringData
+		return b.CreateExtractValue(argValues[0], 0, "slice.data"), nil
 	default:
 		return llvm.Value{}, b.makeError(pos, "todo: builtin: "+callName)
 	}
@@ -1649,11 +1822,12 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) {
 	var params []llvm.Value
 	for _, param := range instr.Args {
-		params = append(params, b.getValue(param))
+		params = append(params, b.getValue(param, getPos(instr)))
 	}
 
 	// Try to call the function directly for trivially static calls.
 	var callee, context llvm.Value
+	var calleeType llvm.Type
 	exported := false
 	if fn := instr.StaticCallee(); fn != nil {
 		// Direct function call, either to a named or anonymous (directly
@@ -1665,9 +1839,9 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 		case name == "device.AsmFull" || name == "device/arm.AsmFull" || name == "device/arm64.AsmFull" || name == "device/avr.AsmFull" || name == "device/riscv.AsmFull":
 			return b.createInlineAsmFull(instr)
 		case strings.HasPrefix(name, "device/arm.SVCall"):
-			return b.emitSVCall(instr.Args)
+			return b.emitSVCall(instr.Args, getPos(instr))
 		case strings.HasPrefix(name, "device/arm64.SVCall"):
-			return b.emitSV64Call(instr.Args)
+			return b.emitSV64Call(instr.Args, getPos(instr))
 		case strings.HasPrefix(name, "(device/riscv.CSR)."):
 			return b.emitCSROperation(instr)
 		case strings.HasPrefix(name, "syscall.Syscall") || strings.HasPrefix(name, "syscall.RawSyscall"):
@@ -1684,7 +1858,7 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 			return b.createInterruptGlobal(instr)
 		}
 
-		callee = b.getFunction(fn)
+		calleeType, callee = b.getFunction(fn)
 		info := b.getFunctionInfo(fn)
 		if callee.IsNil() {
 			return llvm.Value{}, b.makeError(instr.Pos(), "undefined function: "+info.linkName)
@@ -1692,19 +1866,18 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 		switch value := instr.Value.(type) {
 		case *ssa.Function:
 			// Regular function call. No context is necessary.
-			context = llvm.Undef(b.i8ptrType)
+			context = llvm.Undef(b.dataPtrType)
 			if info.variadic && len(fn.Params) == 0 {
 				// This matches Clang, see: https://godbolt.org/z/Gqv49xKMq
 				// Eventually we might be able to eliminate this special case
 				// entirely. For details, see:
 				// https://discourse.llvm.org/t/rfc-enabling-wstrict-prototypes-by-default-in-c/60521
-				fnType := llvm.FunctionType(callee.Type().ElementType().ReturnType(), nil, false)
-				callee = llvm.ConstBitCast(callee, llvm.PointerType(fnType, b.funcPtrAddrSpace))
+				calleeType = llvm.FunctionType(callee.GlobalValueType().ReturnType(), nil, false)
 			}
 		case *ssa.MakeClosure:
 			// A call on a func value, but the callee is trivial to find. For
 			// example: immediately applied functions.
-			funcValue := b.getValue(value)
+			funcValue := b.getValue(value, getPos(value))
 			context = b.extractFuncContext(funcValue)
 		default:
 			panic("StaticCallee returned an unexpected value")
@@ -1719,20 +1892,22 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 		return b.createBuiltin(argTypes, params, call.Name(), instr.Pos())
 	} else if instr.IsInvoke() {
 		// Interface method call (aka invoke call).
-		itf := b.getValue(instr.Value) // interface value (runtime._interface)
+		itf := b.getValue(instr.Value, getPos(instr)) // interface value (runtime._interface)
 		typecode := b.CreateExtractValue(itf, 0, "invoke.func.typecode")
 		value := b.CreateExtractValue(itf, 1, "invoke.func.value") // receiver
 		// Prefix the params with receiver value and suffix with typecode.
 		params = append([]llvm.Value{value}, params...)
 		params = append(params, typecode)
 		callee = b.getInvokeFunction(instr)
-		context = llvm.Undef(b.i8ptrType)
+		calleeType = callee.GlobalValueType()
+		context = llvm.Undef(b.dataPtrType)
 	} else {
 		// Function pointer.
-		value := b.getValue(instr.Value)
+		value := b.getValue(instr.Value, getPos(instr))
 		// This is a func value, which cannot be called directly. We have to
 		// extract the function pointer and context first from the func value.
-		callee, context = b.decodeFuncValue(value, instr.Value.Type().Underlying().(*types.Signature))
+		callee, context = b.decodeFuncValue(value)
+		calleeType = b.getLLVMFunctionType(instr.Value.Type().Underlying().(*types.Signature))
 		b.createNilCheck(instr.Value, callee, "fpcall")
 	}
 
@@ -1742,21 +1917,30 @@ func (b *builder) createFunctionCall(instr *ssa.CallCommon) (llvm.Value, error) 
 		params = append(params, context)
 	}
 
-	return b.createInvoke(callee, params, ""), nil
+	return b.createInvoke(calleeType, callee, params, ""), nil
 }
 
 // getValue returns the LLVM value of a constant, function value, global, or
 // already processed SSA expression.
-func (b *builder) getValue(expr ssa.Value) llvm.Value {
+func (b *builder) getValue(expr ssa.Value, pos token.Pos) llvm.Value {
 	switch expr := expr.(type) {
 	case *ssa.Const:
-		return b.createConst(expr)
+		if pos == token.NoPos {
+			// If the position isn't known, at least try to find in which file
+			// it is defined.
+			file := b.program.Fset.File(b.fn.Pos())
+			if file != nil {
+				pos = file.Pos(0)
+			}
+		}
+		return b.createConst(expr, pos)
 	case *ssa.Function:
 		if b.getFunctionInfo(expr).exported {
 			b.addError(expr.Pos(), "cannot use an exported function as value: "+expr.String())
 			return llvm.Undef(b.getLLVMType(expr.Type()))
 		}
-		return b.createFuncValue(b.getFunction(expr), llvm.Undef(b.i8ptrType), expr.Signature)
+		_, fn := b.getFunction(expr)
+		return b.createFuncValue(fn, llvm.Undef(b.dataPtrType), expr.Signature)
 	case *ssa.Global:
 		value := b.getGlobal(expr)
 		if value.IsNil() {
@@ -1824,7 +2008,6 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			sizeValue := llvm.ConstInt(b.uintptrType, size, false)
 			layoutValue := b.createObjectLayout(typ, expr.Pos())
 			buf := b.createRuntimeCall("alloc", []llvm.Value{sizeValue, layoutValue}, expr.Comment)
-			buf = b.CreateBitCast(buf, llvm.PointerType(typ, 0), "")
 			return buf, nil
 		} else {
 			buf := llvmutil.CreateEntryBlockAlloca(b.Builder, typ, expr.Comment)
@@ -1834,8 +2017,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			return buf, nil
 		}
 	case *ssa.BinOp:
-		x := b.getValue(expr.X)
-		y := b.getValue(expr.Y)
+		x := b.getValue(expr.X, getPos(expr))
+		y := b.getValue(expr.Y, getPos(expr))
 		return b.createBinOp(expr.Op, expr.X.Type(), expr.Y.Type(), x, y, expr.Pos())
 	case *ssa.Call:
 		return b.createFunctionCall(expr.Common())
@@ -1846,12 +2029,12 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// This is different from how the official Go compiler works, because of
 		// heap allocation and because it's easier to implement, see:
 		// https://research.swtch.com/interfaces
-		return b.getValue(expr.X), nil
+		return b.getValue(expr.X, getPos(expr)), nil
 	case *ssa.ChangeType:
 		// This instruction changes the type, but the underlying value remains
 		// the same. This is often a no-op, but sometimes we have to change the
 		// LLVM type as well.
-		x := b.getValue(expr.X)
+		x := b.getValue(expr.X, getPos(expr))
 		llvmType := b.getLLVMType(expr.Type())
 		if x.Type() == llvmType {
 			// Different Go type but same LLVM type (for example, named int).
@@ -1870,30 +2053,26 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				value = b.CreateInsertValue(value, field, i, "changetype.struct")
 			}
 			return value, nil
-		case llvm.PointerTypeKind:
-			// This can happen with pointers to structs. This case is easy:
-			// simply bitcast the pointer to the destination type.
-			return b.CreateBitCast(x, llvmType, "changetype.pointer"), nil
 		default:
 			return llvm.Value{}, errors.New("todo: unknown ChangeType type: " + expr.X.Type().String())
 		}
 	case *ssa.Const:
 		panic("const is not an expression")
 	case *ssa.Convert:
-		x := b.getValue(expr.X)
+		x := b.getValue(expr.X, getPos(expr))
 		return b.createConvert(expr.X.Type(), expr.Type(), x, expr.Pos())
 	case *ssa.Extract:
 		if _, ok := expr.Tuple.(*ssa.Select); ok {
 			return b.getChanSelectResult(expr), nil
 		}
-		value := b.getValue(expr.Tuple)
+		value := b.getValue(expr.Tuple, getPos(expr))
 		return b.CreateExtractValue(value, expr.Index, ""), nil
 	case *ssa.Field:
-		value := b.getValue(expr.X)
+		value := b.getValue(expr.X, getPos(expr))
 		result := b.CreateExtractValue(value, expr.Field, "")
 		return result, nil
 	case *ssa.FieldAddr:
-		val := b.getValue(expr.X)
+		val := b.getValue(expr.X, getPos(expr))
 		// Check for nil pointer before calculating the address, from the spec:
 		// > For an operand x of type T, the address operation &x generates a
 		// > pointer of type *T to x. [...] If the evaluation of x would cause a
@@ -1904,46 +2083,77 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			llvm.ConstInt(b.ctx.Int32Type(), 0, false),
 			llvm.ConstInt(b.ctx.Int32Type(), uint64(expr.Field), false),
 		}
-		return b.CreateInBoundsGEP(val, indices, ""), nil
+		elementType := b.getLLVMType(expr.X.Type().Underlying().(*types.Pointer).Elem())
+		return b.CreateInBoundsGEP(elementType, val, indices, ""), nil
 	case *ssa.Function:
 		panic("function is not an expression")
 	case *ssa.Global:
 		panic("global is not an expression")
 	case *ssa.Index:
-		array := b.getValue(expr.X)
-		index := b.getValue(expr.Index)
+		collection := b.getValue(expr.X, getPos(expr))
+		index := b.getValue(expr.Index, getPos(expr))
 
-		// Extend index to at least uintptr size, because getelementptr assumes
-		// index is a signed integer.
-		index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
+		switch xType := expr.X.Type().Underlying().(type) {
+		case *types.Basic: // extract byte from string
+			// Value type must be a string, which is a basic type.
+			if xType.Info()&types.IsString == 0 {
+				panic("lookup on non-string?")
+			}
 
-		// Check bounds.
-		arrayLen := expr.X.Type().Underlying().(*types.Array).Len()
-		arrayLenLLVM := llvm.ConstInt(b.uintptrType, uint64(arrayLen), false)
-		b.createLookupBoundsCheck(arrayLenLLVM, index)
+			// Sometimes, the index can be e.g. an uint8 or int8, and we have to
+			// correctly extend that type for two reasons:
+			//  1. The lookup bounds check expects an index of at least uintptr
+			//     size.
+			//  2. getelementptr has signed operands, and therefore s[uint8(x)]
+			//     can be lowered as s[int8(x)]. That would be a bug.
+			index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
 
-		// Can't load directly from array (as index is non-constant), so have to
-		// do it using an alloca+gep+load.
-		alloca, allocaPtr, allocaSize := b.createTemporaryAlloca(array.Type(), "index.alloca")
-		b.CreateStore(array, alloca)
-		zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
-		ptr := b.CreateInBoundsGEP(alloca, []llvm.Value{zero, index}, "index.gep")
-		result := b.CreateLoad(ptr, "index.load")
-		b.emitLifetimeEnd(allocaPtr, allocaSize)
-		return result, nil
+			// Bounds check.
+			length := b.CreateExtractValue(collection, 1, "len")
+			b.createLookupBoundsCheck(length, index)
+
+			// Lookup byte
+			buf := b.CreateExtractValue(collection, 0, "")
+			bufElemType := b.ctx.Int8Type()
+			bufPtr := b.CreateInBoundsGEP(bufElemType, buf, []llvm.Value{index}, "")
+			return b.CreateLoad(bufElemType, bufPtr, ""), nil
+		case *types.Array: // extract element from array
+			// Extend index to at least uintptr size, because getelementptr
+			// assumes index is a signed integer.
+			index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
+
+			// Check bounds.
+			arrayLen := llvm.ConstInt(b.uintptrType, uint64(xType.Len()), false)
+			b.createLookupBoundsCheck(arrayLen, index)
+
+			// Can't load directly from array (as index is non-constant), so
+			// have to do it using an alloca+gep+load.
+			arrayType := collection.Type()
+			alloca, allocaSize := b.createTemporaryAlloca(arrayType, "index.alloca")
+			b.CreateStore(collection, alloca)
+			zero := llvm.ConstInt(b.ctx.Int32Type(), 0, false)
+			ptr := b.CreateInBoundsGEP(arrayType, alloca, []llvm.Value{zero, index}, "index.gep")
+			result := b.CreateLoad(arrayType.ElementType(), ptr, "index.load")
+			b.emitLifetimeEnd(alloca, allocaSize)
+			return result, nil
+		default:
+			panic("unknown *ssa.Index type")
+		}
 	case *ssa.IndexAddr:
-		val := b.getValue(expr.X)
-		index := b.getValue(expr.Index)
+		val := b.getValue(expr.X, getPos(expr))
+		index := b.getValue(expr.Index, getPos(expr))
 
 		// Get buffer pointer and length
 		var bufptr, buflen llvm.Value
+		var bufType llvm.Type
 		switch ptrTyp := expr.X.Type().Underlying().(type) {
 		case *types.Pointer:
-			typ := expr.X.Type().Underlying().(*types.Pointer).Elem().Underlying()
+			typ := ptrTyp.Elem().Underlying()
 			switch typ := typ.(type) {
 			case *types.Array:
 				bufptr = val
 				buflen = llvm.ConstInt(b.uintptrType, uint64(typ.Len()), false)
+				bufType = b.getLLVMType(typ)
 				// Check for nil pointer before calculating the address, from
 				// the spec:
 				// > For an operand x of type T, the address operation &x
@@ -1957,6 +2167,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		case *types.Slice:
 			bufptr = b.CreateExtractValue(val, 0, "indexaddr.ptr")
 			buflen = b.CreateExtractValue(val, 1, "indexaddr.len")
+			bufType = b.getLLVMType(ptrTyp.Elem())
 		default:
 			return llvm.Value{}, b.makeError(expr.Pos(), "todo: indexaddr: "+ptrTyp.String())
 		}
@@ -1974,59 +2185,32 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				llvm.ConstInt(b.ctx.Int32Type(), 0, false),
 				index,
 			}
-			return b.CreateInBoundsGEP(bufptr, indices, ""), nil
+			return b.CreateInBoundsGEP(bufType, bufptr, indices, ""), nil
 		case *types.Slice:
-			return b.CreateInBoundsGEP(bufptr, []llvm.Value{index}, ""), nil
+			return b.CreateInBoundsGEP(bufType, bufptr, []llvm.Value{index}, ""), nil
 		default:
 			panic("unreachable")
 		}
-	case *ssa.Lookup:
-		value := b.getValue(expr.X)
-		index := b.getValue(expr.Index)
-		switch xType := expr.X.Type().Underlying().(type) {
-		case *types.Basic:
-			// Value type must be a string, which is a basic type.
-			if xType.Info()&types.IsString == 0 {
-				panic("lookup on non-string?")
-			}
-
-			// Sometimes, the index can be e.g. an uint8 or int8, and we have to
-			// correctly extend that type for two reasons:
-			//  1. The lookup bounds check expects an index of at least uintptr
-			//     size.
-			//  2. getelementptr has signed operands, and therefore s[uint8(x)]
-			//     can be lowered as s[int8(x)]. That would be a bug.
-			index = b.extendInteger(index, expr.Index.Type(), b.uintptrType)
-
-			// Bounds check.
-			length := b.CreateExtractValue(value, 1, "len")
-			b.createLookupBoundsCheck(length, index)
-
-			// Lookup byte
-			buf := b.CreateExtractValue(value, 0, "")
-			bufPtr := b.CreateInBoundsGEP(buf, []llvm.Value{index}, "")
-			return b.CreateLoad(bufPtr, ""), nil
-		case *types.Map:
-			valueType := expr.Type()
-			if expr.CommaOk {
-				valueType = valueType.(*types.Tuple).At(0).Type()
-			}
-			return b.createMapLookup(xType.Key(), valueType, value, index, expr.CommaOk, expr.Pos())
-		default:
-			panic("unknown lookup type: " + expr.String())
+	case *ssa.Lookup: // map lookup
+		value := b.getValue(expr.X, getPos(expr))
+		index := b.getValue(expr.Index, getPos(expr))
+		valueType := expr.Type()
+		if expr.CommaOk {
+			valueType = valueType.(*types.Tuple).At(0).Type()
 		}
+		return b.createMapLookup(expr.X.Type().Underlying().(*types.Map).Key(), valueType, value, index, expr.CommaOk, expr.Pos())
 	case *ssa.MakeChan:
 		return b.createMakeChan(expr), nil
 	case *ssa.MakeClosure:
 		return b.parseMakeClosure(expr)
 	case *ssa.MakeInterface:
-		val := b.getValue(expr.X)
+		val := b.getValue(expr.X, getPos(expr))
 		return b.createMakeInterface(val, expr.X.Type(), expr.Pos()), nil
 	case *ssa.MakeMap:
 		return b.createMakeMap(expr)
 	case *ssa.MakeSlice:
-		sliceLen := b.getValue(expr.Len)
-		sliceCap := b.getValue(expr.Cap)
+		sliceLen := b.getValue(expr.Len, getPos(expr))
+		sliceCap := b.getValue(expr.Cap, getPos(expr))
 		sliceType := expr.Type().Underlying().(*types.Slice)
 		llvmElemType := b.getLLVMType(sliceType.Elem())
 		elemSize := b.targetData.TypeAllocSize(llvmElemType)
@@ -2053,7 +2237,6 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		sliceSize := b.CreateBinOp(llvm.Mul, elemSizeValue, sliceCapCast, "makeslice.cap")
 		layoutValue := b.createObjectLayout(llvmElemType, expr.Pos())
 		slicePtr := b.createRuntimeCall("alloc", []llvm.Value{sliceSize, layoutValue}, "makeslice.buf")
-		slicePtr = b.CreateBitCast(slicePtr, llvm.PointerType(llvmElemType, 0), "makeslice.array")
 
 		// Extend or truncate if necessary. This is safe as we've already done
 		// the bounds check.
@@ -2078,8 +2261,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		return slice, nil
 	case *ssa.Next:
 		rangeVal := expr.Iter.(*ssa.Range).X
-		llvmRangeVal := b.getValue(rangeVal)
-		it := b.getValue(expr.Iter)
+		llvmRangeVal := b.getValue(rangeVal, getPos(expr))
+		it := b.getValue(expr.Iter, getPos(expr))
 		if expr.IsString {
 			return b.createRuntimeCall("stringNext", []llvm.Value{llvmRangeVal, it}, "range.next"), nil
 		} else { // map
@@ -2099,20 +2282,20 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		default:
 			panic("unknown type in range: " + typ.String())
 		}
-		it, _, _ := b.createTemporaryAlloca(iteratorType, "range.it")
+		it, _ := b.createTemporaryAlloca(iteratorType, "range.it")
 		b.CreateStore(llvm.ConstNull(iteratorType), it)
 		return it, nil
 	case *ssa.Select:
 		return b.createSelect(expr), nil
 	case *ssa.Slice:
-		value := b.getValue(expr.X)
+		value := b.getValue(expr.X, getPos(expr))
 
 		var lowType, highType, maxType *types.Basic
 		var low, high, max llvm.Value
 
 		if expr.Low != nil {
 			lowType = expr.Low.Type().Underlying().(*types.Basic)
-			low = b.getValue(expr.Low)
+			low = b.getValue(expr.Low, getPos(expr))
 			low = b.extendInteger(low, lowType, b.uintptrType)
 		} else {
 			lowType = types.Typ[types.Uintptr]
@@ -2121,7 +2304,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 
 		if expr.High != nil {
 			highType = expr.High.Type().Underlying().(*types.Basic)
-			high = b.getValue(expr.High)
+			high = b.getValue(expr.High, getPos(expr))
 			high = b.extendInteger(high, highType, b.uintptrType)
 		} else {
 			highType = types.Typ[types.Uintptr]
@@ -2129,7 +2312,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 
 		if expr.Max != nil {
 			maxType = expr.Max.Type().Underlying().(*types.Basic)
-			max = b.getValue(expr.Max)
+			max = b.getValue(expr.Max, getPos(expr))
 			max = b.extendInteger(max, maxType, b.uintptrType)
 		} else {
 			maxType = types.Typ[types.Uintptr]
@@ -2138,7 +2321,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		switch typ := expr.X.Type().Underlying().(type) {
 		case *types.Pointer: // pointer to array
 			// slice an array
-			length := typ.Elem().Underlying().(*types.Array).Len()
+			arrayType := typ.Elem().Underlying().(*types.Array)
+			length := arrayType.Len()
 			llvmLen := llvm.ConstInt(b.uintptrType, uint64(length), false)
 			if high.IsNil() {
 				high = llvmLen
@@ -2167,7 +2351,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 			}
 
 			sliceLen := b.CreateSub(high, low, "slice.len")
-			slicePtr := b.CreateInBoundsGEP(value, indices, "slice.ptr")
+			slicePtr := b.CreateInBoundsGEP(b.getLLVMType(arrayType), value, indices, "slice.ptr")
 			sliceCap := b.CreateSub(max, low, "slice.cap")
 
 			slice := b.ctx.ConstStruct([]llvm.Value{
@@ -2206,7 +2390,8 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				max = b.CreateTrunc(max, b.uintptrType, "")
 			}
 
-			newPtr := b.CreateInBoundsGEP(oldPtr, []llvm.Value{low}, "")
+			ptrElemType := b.getLLVMType(typ.Elem())
+			newPtr := b.CreateInBoundsGEP(ptrElemType, oldPtr, []llvm.Value{low}, "")
 			newLen := b.CreateSub(high, low, "")
 			newCap := b.CreateSub(max, low, "")
 			slice := b.ctx.ConstStruct([]llvm.Value{
@@ -2246,7 +2431,7 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 				high = b.CreateTrunc(high, b.uintptrType, "")
 			}
 
-			newPtr := b.CreateInBoundsGEP(oldPtr, []llvm.Value{low}, "")
+			newPtr := b.CreateInBoundsGEP(b.ctx.Int8Type(), oldPtr, []llvm.Value{low}, "")
 			newLen := b.CreateSub(high, low, "")
 			str := llvm.Undef(b.getLLVMRuntimeType("_string"))
 			str = b.CreateInsertValue(str, newPtr, 0, "")
@@ -2260,12 +2445,11 @@ func (b *builder) createExpr(expr ssa.Value) (llvm.Value, error) {
 		// Conversion from a slice to an array pointer, as the name clearly
 		// says. This requires a runtime check to make sure the slice is at
 		// least as big as the array.
-		slice := b.getValue(expr.X)
+		slice := b.getValue(expr.X, getPos(expr))
 		sliceLen := b.CreateExtractValue(slice, 1, "")
 		arrayLen := expr.Type().Underlying().(*types.Pointer).Elem().Underlying().(*types.Array).Len()
 		b.createSliceToArrayPointerCheck(sliceLen, arrayLen)
 		ptr := b.CreateExtractValue(slice, 0, "")
-		ptr = b.CreateBitCast(ptr, b.getLLVMType(expr.Type()), "")
 		return ptr, nil
 	case *ssa.TypeAssert:
 		return b.createTypeAssert(expr), nil
@@ -2693,7 +2877,7 @@ func (b *builder) createBinOp(op token.Token, typ, ytyp types.Type, x, y llvm.Va
 }
 
 // createConst creates a LLVM constant value from a Go constant.
-func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
+func (c *compilerContext) createConst(expr *ssa.Const, pos token.Pos) llvm.Value {
 	switch typ := expr.Type().Underlying().(type) {
 	case *types.Basic:
 		llvmType := c.getLLVMType(typ)
@@ -2709,25 +2893,38 @@ func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
 			var strPtr llvm.Value
 			if str != "" {
 				objname := c.pkg.Path() + "$string"
-				global := llvm.AddGlobal(c.mod, llvm.ArrayType(c.ctx.Int8Type(), len(str)), objname)
+				globalType := llvm.ArrayType(c.ctx.Int8Type(), len(str))
+				global := llvm.AddGlobal(c.mod, globalType, objname)
 				global.SetInitializer(c.ctx.ConstString(str, false))
 				global.SetLinkage(llvm.InternalLinkage)
 				global.SetGlobalConstant(true)
 				global.SetUnnamedAddr(true)
 				global.SetAlignment(1)
+				if c.Debug {
+					// Unfortunately, expr.Pos() is always token.NoPos.
+					position := c.program.Fset.Position(pos)
+					diglobal := c.dibuilder.CreateGlobalVariableExpression(llvm.Metadata{}, llvm.DIGlobalVariableExpression{
+						File:        c.getDIFile(position.Filename),
+						Line:        position.Line,
+						Type:        c.getDIType(types.NewArray(types.Typ[types.Byte], int64(len(str)))),
+						LocalToUnit: true,
+						Expr:        c.dibuilder.CreateExpression(nil),
+					})
+					global.AddMetadata(0, diglobal)
+				}
 				zero := llvm.ConstInt(c.ctx.Int32Type(), 0, false)
-				strPtr = llvm.ConstInBoundsGEP(global, []llvm.Value{zero, zero})
+				strPtr = llvm.ConstInBoundsGEP(globalType, global, []llvm.Value{zero, zero})
 			} else {
-				strPtr = llvm.ConstNull(c.i8ptrType)
+				strPtr = llvm.ConstNull(c.dataPtrType)
 			}
 			strObj := llvm.ConstNamedStruct(c.getLLVMRuntimeType("_string"), []llvm.Value{strPtr, strLen})
 			return strObj
 		} else if typ.Kind() == types.UnsafePointer {
 			if !expr.IsNil() {
 				value, _ := constant.Uint64Val(constant.ToInt(expr.Value))
-				return llvm.ConstIntToPtr(llvm.ConstInt(c.uintptrType, value, false), c.i8ptrType)
+				return llvm.ConstIntToPtr(llvm.ConstInt(c.uintptrType, value, false), c.dataPtrType)
 			}
-			return llvm.ConstNull(c.i8ptrType)
+			return llvm.ConstNull(c.dataPtrType)
 		} else if typ.Info()&types.IsUnsigned != 0 {
 			n, _ := constant.Uint64Val(constant.ToInt(expr.Value))
 			return llvm.ConstInt(llvmType, n, false)
@@ -2738,18 +2935,18 @@ func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
 			n, _ := constant.Float64Val(expr.Value)
 			return llvm.ConstFloat(llvmType, n)
 		} else if typ.Kind() == types.Complex64 {
-			r := c.createConst(ssa.NewConst(constant.Real(expr.Value), types.Typ[types.Float32]))
-			i := c.createConst(ssa.NewConst(constant.Imag(expr.Value), types.Typ[types.Float32]))
+			r := c.createConst(ssa.NewConst(constant.Real(expr.Value), types.Typ[types.Float32]), pos)
+			i := c.createConst(ssa.NewConst(constant.Imag(expr.Value), types.Typ[types.Float32]), pos)
 			cplx := llvm.Undef(c.ctx.StructType([]llvm.Type{c.ctx.FloatType(), c.ctx.FloatType()}, false))
-			cplx = llvm.ConstInsertValue(cplx, r, []uint32{0})
-			cplx = llvm.ConstInsertValue(cplx, i, []uint32{1})
+			cplx = c.builder.CreateInsertValue(cplx, r, 0, "")
+			cplx = c.builder.CreateInsertValue(cplx, i, 1, "")
 			return cplx
 		} else if typ.Kind() == types.Complex128 {
-			r := c.createConst(ssa.NewConst(constant.Real(expr.Value), types.Typ[types.Float64]))
-			i := c.createConst(ssa.NewConst(constant.Imag(expr.Value), types.Typ[types.Float64]))
+			r := c.createConst(ssa.NewConst(constant.Real(expr.Value), types.Typ[types.Float64]), pos)
+			i := c.createConst(ssa.NewConst(constant.Imag(expr.Value), types.Typ[types.Float64]), pos)
 			cplx := llvm.Undef(c.ctx.StructType([]llvm.Type{c.ctx.DoubleType(), c.ctx.DoubleType()}, false))
-			cplx = llvm.ConstInsertValue(cplx, r, []uint32{0})
-			cplx = llvm.ConstInsertValue(cplx, i, []uint32{1})
+			cplx = c.builder.CreateInsertValue(cplx, r, 0, "")
+			cplx = c.builder.CreateInsertValue(cplx, i, 1, "")
 			return cplx
 		} else {
 			panic("unknown constant of basic type: " + expr.String())
@@ -2771,7 +2968,7 @@ func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
 		// Create a generic nil interface with no dynamic type (typecode=0).
 		fields := []llvm.Value{
 			llvm.ConstInt(c.uintptrType, 0, false),
-			llvm.ConstPointerNull(c.i8ptrType),
+			llvm.ConstPointerNull(c.dataPtrType),
 		}
 		return llvm.ConstNamedStruct(c.getLLVMRuntimeType("_interface"), fields)
 	case *types.Pointer:
@@ -2779,12 +2976,16 @@ func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
 			panic("expected nil pointer constant")
 		}
 		return llvm.ConstPointerNull(c.getLLVMType(typ))
+	case *types.Array:
+		if expr.Value != nil {
+			panic("expected nil array constant")
+		}
+		return llvm.ConstNull(c.getLLVMType(expr.Type()))
 	case *types.Slice:
 		if expr.Value != nil {
 			panic("expected nil slice constant")
 		}
-		elemType := c.getLLVMType(typ.Elem())
-		llvmPtr := llvm.ConstPointerNull(llvm.PointerType(elemType, 0))
+		llvmPtr := llvm.ConstPointerNull(c.dataPtrType)
 		llvmLen := llvm.ConstInt(c.uintptrType, 0, false)
 		slice := c.ctx.ConstStruct([]llvm.Value{
 			llvmPtr, // backing array
@@ -2792,6 +2993,11 @@ func (c *compilerContext) createConst(expr *ssa.Const) llvm.Value {
 			llvmLen, // cap
 		}, false)
 		return slice
+	case *types.Struct:
+		if expr.Value != nil {
+			panic("expected nil struct constant")
+		}
+		return llvm.ConstNull(c.getLLVMType(expr.Type()))
 	case *types.Map:
 		if !expr.IsNil() {
 			// I believe this is not allowed by the Go spec.
@@ -2815,37 +3021,12 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 	if isPtrFrom && !isPtrTo {
 		return b.CreatePtrToInt(value, llvmTypeTo, ""), nil
 	} else if !isPtrFrom && isPtrTo {
-		if !value.IsABinaryOperator().IsNil() && value.InstructionOpcode() == llvm.Add {
-			// This is probably a pattern like the following:
-			// unsafe.Pointer(uintptr(ptr) + index)
-			// Used in functions like memmove etc. for lack of pointer
-			// arithmetic. Convert it to real pointer arithmatic here.
-			ptr := value.Operand(0)
-			index := value.Operand(1)
-			if !index.IsAPtrToIntInst().IsNil() {
-				// Swap if necessary, if ptr and index are reversed.
-				ptr, index = index, ptr
-			}
-			if !ptr.IsAPtrToIntInst().IsNil() {
-				origptr := ptr.Operand(0)
-				if origptr.Type() == b.i8ptrType {
-					// This pointer can be calculated from the original
-					// ptrtoint instruction with a GEP. The leftover inttoptr
-					// instruction is trivial to optimize away.
-					// Making it an in bounds GEP even though it's easy to
-					// create a GEP that is not in bounds. However, we're
-					// talking about unsafe code here so the programmer has to
-					// be careful anyway.
-					return b.CreateInBoundsGEP(origptr, []llvm.Value{index}, ""), nil
-				}
-			}
-		}
 		return b.CreateIntToPtr(value, llvmTypeTo, ""), nil
 	}
 
 	// Conversion between pointers and unsafe.Pointer.
 	if isPtrFrom && isPtrTo {
-		return b.CreateBitCast(value, llvmTypeTo, ""), nil
+		return value, nil
 	}
 
 	switch typeTo := typeTo.Underlying().(type) {
@@ -3042,7 +3223,7 @@ func (b *builder) createConvert(typeFrom, typeTo types.Type, value llvm.Value, p
 // which can all be directly lowered to IR. However, there is also the channel
 // receive operator which is handled in the runtime directly.
 func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
-	x := b.getValue(unop.X)
+	x := b.getValue(unop.X, getPos(unop))
 	switch unop.Op {
 	case token.NOT: // !x
 		return b.CreateNot(x, ""), nil
@@ -3069,10 +3250,10 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			return llvm.Value{}, b.makeError(unop.Pos(), "todo: unknown type for negate: "+unop.X.Type().Underlying().String())
 		}
 	case token.MUL: // *x, dereference pointer
-		unop.X.Type().Underlying().(*types.Pointer).Elem()
-		if b.targetData.TypeAllocSize(x.Type().ElementType()) == 0 {
+		valueType := b.getLLVMType(unop.X.Type().Underlying().(*types.Pointer).Elem())
+		if b.targetData.TypeAllocSize(valueType) == 0 {
 			// zero-length data
-			return llvm.ConstNull(x.Type().ElementType()), nil
+			return llvm.ConstNull(valueType), nil
 		} else if strings.HasSuffix(unop.X.String(), "$funcaddr") {
 			// CGo function pointer. The cgo part has rewritten CGo function
 			// pointers as stub global variables of the form:
@@ -3080,14 +3261,14 @@ func (b *builder) createUnOp(unop *ssa.UnOp) (llvm.Value, error) {
 			// Instead of a load from the global, create a bitcast of the
 			// function pointer itself.
 			name := strings.TrimSuffix(unop.X.(*ssa.Global).Name(), "$funcaddr")
-			fn := b.getFunction(b.fn.Pkg.Members[name].(*ssa.Function))
+			_, fn := b.getFunction(b.fn.Pkg.Members[name].(*ssa.Function))
 			if fn.IsNil() {
 				return llvm.Value{}, b.makeError(unop.Pos(), "cgo function not found: "+name)
 			}
-			return b.CreateBitCast(fn, b.i8ptrType, ""), nil
+			return fn, nil
 		} else {
 			b.createNilCheck(unop.X, x, "deref")
-			load := b.CreateLoad(x, "")
+			load := b.CreateLoad(valueType, x, "")
 			return load, nil
 		}
 	case token.XOR: // ^x, toggle all bits in integer

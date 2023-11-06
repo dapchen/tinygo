@@ -23,45 +23,45 @@ import (
 // https://doc.rust-lang.org/nightly/nightly-rustc/rustc_target/spec/struct.TargetOptions.html
 // https://github.com/shepmaster/rust-arduino-blink-led-no-core-with-cargo/blob/master/blink/arduino.json
 type TargetSpec struct {
-	Inherits         []string `json:"inherits"`
-	Triple           string   `json:"llvm-target"`
-	CPU              string   `json:"cpu"`
-	Features         string   `json:"features"`
-	GOOS             string   `json:"goos"`
-	GOARCH           string   `json:"goarch"`
-	BuildTags        []string `json:"build-tags"`
-	GC               string   `json:"gc"`
-	Scheduler        string   `json:"scheduler"`
-	Serial           string   `json:"serial"` // which serial output to use (uart, usb, none)
-	Linker           string   `json:"linker"`
-	RTLib            string   `json:"rtlib"` // compiler runtime library (libgcc, compiler-rt)
-	Libc             string   `json:"libc"`
-	AutoStackSize    *bool    `json:"automatic-stack-size"` // Determine stack size automatically at compile time.
-	DefaultStackSize uint64   `json:"default-stack-size"`   // Default stack size if the size couldn't be determined at compile time.
-	CFlags           []string `json:"cflags"`
-	LDFlags          []string `json:"ldflags"`
-	LinkerScript     string   `json:"linkerscript"`
-	ExtraFiles       []string `json:"extra-files"`
-	RP2040BootPatch  *bool    `json:"rp2040-boot-patch"` // Patch RP2040 2nd stage bootloader checksum
-	Emulator         string   `json:"emulator"`
-	FlashCommand     string   `json:"flash-command"`
-	GDB              []string `json:"gdb"`
-	PortReset        string   `json:"flash-1200-bps-reset"`
-	SerialPort       []string `json:"serial-port"` // serial port IDs in the form "acm:vid:pid" or "usb:vid:pid"
-	FlashMethod      string   `json:"flash-method"`
-	FlashVolume      string   `json:"msd-volume-name"`
-	FlashFilename    string   `json:"msd-firmware-name"`
-	UF2FamilyID      string   `json:"uf2-family-id"`
-	BinaryFormat     string   `json:"binary-format"`
-	OpenOCDInterface string   `json:"openocd-interface"`
-	OpenOCDTarget    string   `json:"openocd-target"`
-	OpenOCDTransport string   `json:"openocd-transport"`
-	OpenOCDCommands  []string `json:"openocd-commands"`
-	OpenOCDVerify    *bool    `json:"openocd-verify"` // enable verify when flashing with openocd
-	JLinkDevice      string   `json:"jlink-device"`
-	CodeModel        string   `json:"code-model"`
-	RelocationModel  string   `json:"relocation-model"`
-	WasmAbi          string   `json:"wasm-abi"`
+	Inherits         []string `json:"inherits,omitempty"`
+	Triple           string   `json:"llvm-target,omitempty"`
+	CPU              string   `json:"cpu,omitempty"`
+	ABI              string   `json:"target-abi,omitempty"` // rougly equivalent to -mabi= flag
+	Features         string   `json:"features,omitempty"`
+	GOOS             string   `json:"goos,omitempty"`
+	GOARCH           string   `json:"goarch,omitempty"`
+	BuildTags        []string `json:"build-tags,omitempty"`
+	GC               string   `json:"gc,omitempty"`
+	Scheduler        string   `json:"scheduler,omitempty"`
+	Serial           string   `json:"serial,omitempty"` // which serial output to use (uart, usb, none)
+	Linker           string   `json:"linker,omitempty"`
+	RTLib            string   `json:"rtlib,omitempty"` // compiler runtime library (libgcc, compiler-rt)
+	Libc             string   `json:"libc,omitempty"`
+	AutoStackSize    *bool    `json:"automatic-stack-size,omitempty"` // Determine stack size automatically at compile time.
+	DefaultStackSize uint64   `json:"default-stack-size,omitempty"`   // Default stack size if the size couldn't be determined at compile time.
+	CFlags           []string `json:"cflags,omitempty"`
+	LDFlags          []string `json:"ldflags,omitempty"`
+	LinkerScript     string   `json:"linkerscript,omitempty"`
+	ExtraFiles       []string `json:"extra-files,omitempty"`
+	RP2040BootPatch  *bool    `json:"rp2040-boot-patch,omitempty"` // Patch RP2040 2nd stage bootloader checksum
+	Emulator         string   `json:"emulator,omitempty"`
+	FlashCommand     string   `json:"flash-command,omitempty"`
+	GDB              []string `json:"gdb,omitempty"`
+	PortReset        string   `json:"flash-1200-bps-reset,omitempty"`
+	SerialPort       []string `json:"serial-port,omitempty"` // serial port IDs in the form "vid:pid"
+	FlashMethod      string   `json:"flash-method,omitempty"`
+	FlashVolume      []string `json:"msd-volume-name,omitempty"`
+	FlashFilename    string   `json:"msd-firmware-name,omitempty"`
+	UF2FamilyID      string   `json:"uf2-family-id,omitempty"`
+	BinaryFormat     string   `json:"binary-format,omitempty"`
+	OpenOCDInterface string   `json:"openocd-interface,omitempty"`
+	OpenOCDTarget    string   `json:"openocd-target,omitempty"`
+	OpenOCDTransport string   `json:"openocd-transport,omitempty"`
+	OpenOCDCommands  []string `json:"openocd-commands,omitempty"`
+	OpenOCDVerify    *bool    `json:"openocd-verify,omitempty"` // enable verify when flashing with openocd
+	JLinkDevice      string   `json:"jlink-device,omitempty"`
+	CodeModel        string   `json:"code-model,omitempty"`
+	RelocationModel  string   `json:"relocation-model,omitempty"`
 }
 
 // overrideProperties overrides all properties that are set in child into itself using reflection.
@@ -191,11 +191,15 @@ func LoadTarget(options *Options) (*TargetSpec, error) {
 			default:
 				return nil, fmt.Errorf("invalid GOARM=%s, must be 5, 6, or 7", options.GOARM)
 			}
+		case "wasm":
+			llvmarch = "wasm32"
 		default:
 			llvmarch = options.GOARCH
 		}
+		llvmvendor := "unknown"
 		llvmos := options.GOOS
-		if llvmos == "darwin" {
+		switch llvmos {
+		case "darwin":
 			// Use macosx* instead of darwin, otherwise darwin/arm64 will refer
 			// to iOS!
 			llvmos = "macosx10.12.0"
@@ -203,12 +207,16 @@ func LoadTarget(options *Options) (*TargetSpec, error) {
 				// Looks like Apple prefers to call this architecture ARM64
 				// instead of AArch64.
 				llvmarch = "arm64"
+				llvmos = "macosx11.0.0"
 			}
+			llvmvendor = "apple"
+		case "wasip1":
+			llvmos = "wasi"
 		}
 		// Target triples (which actually have four components, but are called
 		// triples for historical reasons) have the form:
 		//   arch-vendor-os-environment
-		target := llvmarch + "-unknown-" + llvmos
+		target := llvmarch + "-" + llvmvendor + "-" + llvmos
 		if options.GOOS == "windows" {
 			target += "-gnu"
 		} else if options.GOARCH == "arm" {
@@ -238,6 +246,43 @@ func LoadTarget(options *Options) (*TargetSpec, error) {
 	return spec, nil
 }
 
+// GetTargetSpecs retrieves target specifications from the TINYGOROOT targets
+// directory.  Only valid target JSON files are considered, and the function
+// returns a map of target names to their respective TargetSpec.
+func GetTargetSpecs() (map[string]*TargetSpec, error) {
+	dir := filepath.Join(goenv.Get("TINYGOROOT"), "targets")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("could not list targets: %w", err)
+	}
+
+	maps := map[string]*TargetSpec{}
+	for _, entry := range entries {
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("could not get entry info: %w", err)
+		}
+		if !entryInfo.Mode().IsRegular() || !strings.HasSuffix(entry.Name(), ".json") {
+			// Only inspect JSON files.
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		spec, err := LoadTarget(&Options{Target: path})
+		if err != nil {
+			return nil, fmt.Errorf("could not list target: %w", err)
+		}
+		if spec.FlashMethod == "" && spec.FlashCommand == "" && spec.Emulator == "" {
+			// This doesn't look like a regular target file, but rather like
+			// a parent target (such as targets/cortex-m.json).
+			continue
+		}
+		name := entry.Name()
+		name = name[:len(name)-5]
+		maps[name] = spec
+	}
+	return maps, nil
+}
+
 func defaultTarget(goos, goarch, triple string) (*TargetSpec, error) {
 	// No target spec available. Use the default one, useful on most systems
 	// with a regular OS.
@@ -246,6 +291,7 @@ func defaultTarget(goos, goarch, triple string) (*TargetSpec, error) {
 		GOOS:             goos,
 		GOARCH:           goarch,
 		BuildTags:        []string{goos, goarch},
+		GC:               "precise",
 		Scheduler:        "tasks",
 		Linker:           "cc",
 		DefaultStackSize: 1024 * 64, // 64kB
@@ -272,7 +318,20 @@ func defaultTarget(goos, goarch, triple string) (*TargetSpec, error) {
 		}
 	case "arm64":
 		spec.CPU = "generic"
-		spec.Features = "+neon"
+		if goos == "darwin" {
+			spec.Features = "+neon"
+		} else { // windows, linux
+			spec.Features = "+neon,-fmv"
+		}
+	case "wasm":
+		spec.CPU = "generic"
+		spec.Features = "+bulk-memory,+mutable-globals,+nontrapping-fptoint,+sign-ext"
+		spec.BuildTags = append(spec.BuildTags, "tinygo.wasm")
+		spec.CFlags = append(spec.CFlags,
+			"-mbulk-memory",
+			"-mnontrapping-fptoint",
+			"-msign-ext",
+		)
 	}
 	if goos == "darwin" {
 		spec.Linker = "ld.lld"
@@ -299,22 +358,47 @@ func defaultTarget(goos, goarch, triple string) (*TargetSpec, error) {
 		// normally present in Go (without explicitly opting in).
 		// For more discussion:
 		// https://groups.google.com/g/Golang-nuts/c/Jd9tlNc6jUE/m/Zo-7zIP_m3MJ?pli=1
+		switch goarch {
+		case "amd64":
+			spec.LDFlags = append(spec.LDFlags,
+				"-m", "i386pep",
+				"--image-base", "0x400000",
+			)
+		case "arm64":
+			spec.LDFlags = append(spec.LDFlags,
+				"-m", "arm64pe",
+			)
+		}
 		spec.LDFlags = append(spec.LDFlags,
-			"-m", "i386pep",
 			"-Bdynamic",
-			"--image-base", "0x400000",
 			"--gc-sections",
 			"--no-insert-timestamp",
 			"--no-dynamicbase",
+		)
+	} else if goos == "wasip1" {
+		spec.GC = "" // use default GC
+		spec.Scheduler = "asyncify"
+		spec.Linker = "wasm-ld"
+		spec.RTLib = "compiler-rt"
+		spec.Libc = "wasi-libc"
+		spec.DefaultStackSize = 1024 * 64 // 64kB
+		spec.LDFlags = append(spec.LDFlags,
+			"--stack-first",
+			"--no-demangle",
+		)
+		spec.Emulator = "wasmtime --dir={tmpDir}::/tmp {}"
+		spec.ExtraFiles = append(spec.ExtraFiles,
+			"src/runtime/asm_tinygowasm.S",
+			"src/internal/task/task_asyncify_wasm.S",
 		)
 	} else {
 		spec.LDFlags = append(spec.LDFlags, "-no-pie", "-Wl,--gc-sections") // WARNING: clang < 5.0 requires -nopie
 	}
 	if goarch != "wasm" {
 		suffix := ""
-		if goos == "windows" {
-			// Windows uses a different calling convention from other operating
-			// systems so we need separate assembly files.
+		if goos == "windows" && goarch == "amd64" {
+			// Windows uses a different calling convention on amd64 from other
+			// operating systems so we need separate assembly files.
 			suffix = "_windows"
 		}
 		spec.ExtraFiles = append(spec.ExtraFiles, "src/runtime/asm_"+goarch+suffix+".S")
